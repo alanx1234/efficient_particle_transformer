@@ -11,7 +11,7 @@ import torch.nn as nn
 from functools import partial
 
 from networks.logger import _logger
-from networks.part_core import (
+from networks.parT import (
     build_sparse_tensor, trunc_normal_, SequenceTrimmer, Embed, Block, pairwise_lv_fts
 )
 
