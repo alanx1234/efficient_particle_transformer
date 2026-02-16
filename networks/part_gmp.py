@@ -1,56 +1,173 @@
 import torch
+import torch.nn.functional as F
 
-from EfficientParticleTransformer import EfficientParticleTransformer
+# Import your model (adjust if your filename differs)
+from networks.EfficientParticleTransformer import EfficientParticleTransformerTagger
+
 
 def make_mask(N, P, min_real=10):
-    """
-    Returns mask shaped (N, 1, P) with 1 = real, 0 = padded
-    """
+    """mask: (N,1,P) True=real, False=padded"""
     mask = torch.zeros(N, 1, P, dtype=torch.bool)
     for i in range(N):
         n_real = torch.randint(low=min_real, high=P + 1, size=(1,)).item()
         mask[i, 0, :n_real] = True
     return mask
 
+
 @torch.no_grad()
-def assert_padded_outputs_finite(output, name="output"):
-    if not torch.isfinite(output).all():
-        bad = (~torch.isfinite(output)).sum().item()
+def assert_all_finite(t, name="tensor"):
+    if not torch.isfinite(t).all():
+        bad = (~torch.isfinite(t)).sum().item()
         raise RuntimeError(f"{name} has {bad} non-finite entries (nan/inf).")
+
+
+@torch.no_grad()
+def perturb_only_padded(x, mask, noise_scale=1.0):
+    """
+    x: (N,C,P)
+    mask: (N,1,P) True=real False=padded
+    returns x' where ONLY padded entries are randomized.
+    """
+    x2 = x.clone()
+    pad = (~mask).expand_as(x2)
+    noise = torch.randn_like(x2) * noise_scale
+    x2 = x2.masked_scatter(pad, noise[pad])
+    return x2
+
+
+@torch.no_grad()
+def padding_invariance_test(model, pf_x, pf_v, pf_mask, sv_x, sv_v, sv_mask, trials=5):
+    """
+    Run same batch, but scramble ONLY padded tokens.
+    Output should barely change if padding is handled correctly.
+    """
+    model.eval()
+    base = model(pf_x, pf_v, pf_mask, sv_x, sv_v, sv_mask).detach()
+
+    max_diffs = []
+    mean_diffs = []
+    for _ in range(trials):
+        # perturb PF padded region
+        pf_x2 = perturb_only_padded(pf_x, pf_mask, noise_scale=5.0)
+        pf_v2 = perturb_only_padded(pf_v, pf_mask, noise_scale=5.0)
+        out_pf = model(pf_x2, pf_v2, pf_mask, sv_x, sv_v, sv_mask).detach()
+
+        # perturb SV padded region
+        sv_x2 = perturb_only_padded(sv_x, sv_mask, noise_scale=5.0)
+        sv_v2 = perturb_only_padded(sv_v, sv_mask, noise_scale=5.0)
+        out_sv = model(pf_x, pf_v, pf_mask, sv_x2, sv_v2, sv_mask).detach()
+
+        d_pf = (out_pf - base).abs()
+        d_sv = (out_sv - base).abs()
+
+        max_diffs.append(max(d_pf.max().item(), d_sv.max().item()))
+        mean_diffs.append(0.5 * (d_pf.mean().item() + d_sv.mean().item()))
+
+    print("\n[Padding invariance test]")
+    print(f"  max |Δlogit| over trials: min={min(max_diffs):.4g}, median={sorted(max_diffs)[len(max_diffs)//2]:.4g}, max={max(max_diffs):.4g}")
+    print(f"  mean|Δlogit| over trials: min={min(mean_diffs):.4g}, median={sorted(mean_diffs)[len(mean_diffs)//2]:.4g}, max={max(mean_diffs):.4g}")
+    print("  (Goal: very close to 0. If these are large, padding is leaking.)")
+
+
+@torch.no_grad()
+def gmp_effect_test(model_gmp_off, model_gmp_on, pf_x, pf_v, pf_mask, sv_x, sv_v, sv_mask):
+    """
+    Same batch, compare logits with GMP off vs on.
+    They should differ (otherwise GMP path isn't affecting forward).
+    """
+    model_gmp_off.eval()
+    model_gmp_on.eval()
+    out_off = model_gmp_off(pf_x, pf_v, pf_mask, sv_x, sv_v, sv_mask).detach()
+    out_on  = model_gmp_on(pf_x, pf_v, pf_mask, sv_x, sv_v, sv_mask).detach()
+
+    diff = (out_on - out_off).abs()
+    print("\n[GMP effect test]")
+    print(f"  mean|Δlogit| = {diff.mean().item():.6g}")
+    print(f"  max |Δlogit| = {diff.max().item():.6g}")
+    print("  (Goal: not ~0. If ~0, GMP may be bypassed / disabled.)")
+
+
+def overfit_tiny_batch_test(model, pf_x, pf_v, pf_mask, sv_x, sv_v, sv_mask, num_classes, steps=20, lr=1e-3):
+    """
+    Train on the SAME tiny batch for a few steps.
+    Loss should generally go down.
+    """
+    model.train()
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+
+    # fixed random targets
+    target = torch.randint(0, num_classes, (pf_x.size(0),), device=pf_x.device)
+
+    losses = []
+    for s in range(steps):
+        opt.zero_grad(set_to_none=True)
+        out = model(pf_x, pf_v, pf_mask, sv_x, sv_v, sv_mask)
+        loss = F.cross_entropy(out, target)
+        loss.backward()
+        opt.step()
+        losses.append(loss.detach().item())
+
+    print("\n[Overfit tiny batch test]")
+    print(f"  loss start: {losses[0]:.6g}")
+    print(f"  loss end  : {losses[-1]:.6g}")
+    print("  (Goal: end < start by a noticeable amount. If flat, something may be wrong.)")
+
+
+def build_model(
+    *,
+    pf_input_dim,
+    sv_input_dim,
+    num_classes,
+    device,
+    use_gmp,
+):
+    return EfficientParticleTransformerTagger(
+        pf_input_dim=pf_input_dim,
+        sv_input_dim=sv_input_dim,
+        num_classes=num_classes,
+        num_heads=8,
+        num_layers=2,         # small smoke test
+        num_cls_layers=1,
+        embed_dims=[32, 64, 32],
+        fc_params=[(64, 0.0)],
+        trim=False,
+        use_amp=False,
+        use_gmp=use_gmp,
+        gmp_kernel=3,
+        gmp_grid=0.05,
+        # IMPORTANT: avoid linformer/fairseq in smoke test
+        block_params={"attn_type": "pairs"},
+        # If your PairAttention needed the "None mask" fix, keep it in EfficientParticleTransformer.py
+    ).to(device)
+
 
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(0)
 
-    # ---- dummy shapes (match your expected inputs) ----
-    N = 2          # batch size
-    P_pf = 64      # PF max particles
-    P_sv = 16      # SV max particles
+    N = 2
+    P_pf = 64
+    P_sv = 16
     pf_input_dim = 17
     sv_input_dim = 17
     num_classes = 10
 
-    # ---- build model ----
-    model = EfficientParticleTransformerTagger(
+    model_on = build_model(
         pf_input_dim=pf_input_dim,
         sv_input_dim=sv_input_dim,
         num_classes=num_classes,
-        num_heads=8,
-        num_layers=2,        # small for smoke test
-        num_cls_layers=1,
-        embed_dims=[32, 64, 32],
-        fc_params=[(64, 0.0)],
-        trim=False,          # keep padding behavior visible
-        use_amp=False,
+        device=device,
         use_gmp=True,
-        gmp_kernel=3,
-        gmp_grid=0.05,
-    ).to(device)
+    )
+    model_off = build_model(
+        pf_input_dim=pf_input_dim,
+        sv_input_dim=sv_input_dim,
+        num_classes=num_classes,
+        device=device,
+        use_gmp=False,
+    )
 
-    model.train()
-
-    # ---- dummy inputs ----
-    # pf_x: (N, C, P_pf), pf_v: (N, 4, P_pf), pf_mask: (N, 1, P_pf)
+    # dummy inputs
     pf_x = torch.randn(N, pf_input_dim, P_pf, device=device)
     pf_v = torch.randn(N, 4, P_pf, device=device)
     pf_mask = make_mask(N, P_pf).to(device)
@@ -59,37 +176,34 @@ def main():
     sv_v = torch.randn(N, 4, P_sv, device=device)
     sv_mask = make_mask(N, P_sv, min_real=2).to(device)
 
-    # Force padded tokens to be obviously "fake" to catch leakage
+    # make padded explicitly zero (good baseline)
     pf_x = pf_x.masked_fill(~pf_mask.expand_as(pf_x), 0.0)
     pf_v = pf_v.masked_fill(~pf_mask.expand_as(pf_v), 0.0)
     sv_x = sv_x.masked_fill(~sv_mask.expand_as(sv_x), 0.0)
     sv_v = sv_v.masked_fill(~sv_mask.expand_as(sv_v), 0.0)
 
-    # ---- forward ----
-    out = model(pf_x, pf_v, pf_mask, sv_x, sv_v, sv_mask)
-    print("output shape:", tuple(out.shape))  # expect (N, num_classes)
+    # basic forward
+    model_on.train()
+    out = model_on(pf_x, pf_v, pf_mask, sv_x, sv_v, sv_mask)
+    print("output shape:", tuple(out.shape))
+    assert_all_finite(out, "out")
 
-    assert_padded_outputs_finite(out, "out")
-
-    # ---- backward test ----
+    # quick backward sanity
     target = torch.randint(0, num_classes, (N,), device=device)
-    loss = torch.nn.functional.cross_entropy(out, target)
+    loss = F.cross_entropy(out, target)
     loss.backward()
+    print("loss:", loss.detach().item())
+    print("grad check: ✅ OK")
 
-    # quick grad sanity
-    grads_ok = True
-    for n, p in model.named_parameters():
-        if p.requires_grad and p.grad is None:
-            print("⚠️ no grad:", n)
-            grads_ok = False
-            break
-        if p.grad is not None and not torch.isfinite(p.grad).all():
-            print("❌ non-finite grad:", n)
-            grads_ok = False
-            break
+    # --- A) padding invariance ---
+    padding_invariance_test(model_on, pf_x, pf_v, pf_mask, sv_x, sv_v, sv_mask, trials=5)
 
-    print("loss:", float(loss))
-    print("grad check:", "✅ OK" if grads_ok else "❌ issue")
+    # --- B) GMP effect ---
+    gmp_effect_test(model_off, model_on, pf_x, pf_v, pf_mask, sv_x, sv_v, sv_mask)
+
+    # --- C) overfit tiny batch ---
+    overfit_tiny_batch_test(model_on, pf_x, pf_v, pf_mask, sv_x, sv_v, sv_mask, num_classes, steps=20, lr=1e-3)
+
 
 if __name__ == "__main__":
     main()

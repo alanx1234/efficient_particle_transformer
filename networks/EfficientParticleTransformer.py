@@ -10,8 +10,10 @@ import torch
 import torch.nn as nn
 from functools import partial
 
-from weaver.utils.logger import _logger
-from weaver.nn.model.ParticleTransformer import build_sparse_tensor, trunc_normal_, SequenceTrimmer, Embed, Block, pairwise_lv_fts
+from networks.logger import _logger
+from networks.part_core import (
+    build_sparse_tensor, trunc_normal_, SequenceTrimmer, Embed, Block, pairwise_lv_fts
+)
 
 
 class GeometricMessagePassingTorch(nn.Module):
@@ -292,12 +294,18 @@ class PairAttention(nn.Module):
 
     def forward(self, x, attn_mask):
         # x: (P, N, C)
-        # attn_mask: (N*num_heads, P, P)
-        # output: (P, N, C)
         seq_len = x.size(0)
-        v = self.v_proj(x).view(-1, seq_len, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # (N, num_heads, P, head_dim)
-        attn = self.dropout(torch.softmax(attn_mask, dim=-1).view(-1, self.num_heads, seq_len, seq_len))  # (N, num_heads, P, P)
-        output = torch.matmul(attn, v).permute(2, 0, 1, 3).contiguous().view(seq_len, -1, self.embed_dim)  # (P, N, C)
+        v = self.v_proj(x).view(-1, seq_len, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        if attn_mask is None:
+            # no bias → uniform logits
+            attn = torch.ones(v.size(0), self.num_heads, seq_len, seq_len, device=x.device, dtype=x.dtype)
+            attn = attn / seq_len
+        else:
+            attn = torch.softmax(attn_mask, dim=-1).view(-1, self.num_heads, seq_len, seq_len)
+
+        attn = self.dropout(attn)
+        output = torch.matmul(attn, v).permute(2, 0, 1, 3).contiguous().view(seq_len, -1, self.embed_dim)
         return output, attn
 
 class LinBlock(nn.Module):
@@ -306,7 +314,7 @@ class LinBlock(nn.Module):
         embed_dim=128,
         num_heads=8,
         max_seq_len=128,
-        attn_type="linformer",
+        attn_type="pairs",
         compressed=4,
         bucket_size=32,
         n_hashes=4,
@@ -336,7 +344,7 @@ class LinBlock(nn.Module):
 
         self.pre_attn_norm = nn.LayerNorm(embed_dim)
         if self.attn_type == "linformer":
-            from particle_transformer.networks.multihead_linear_attention import MultiheadLinearAttention
+            from networks.multihead_linear_attention import MultiheadLinearAttention
             shared_compress_layer = nn.Linear(max_seq_len, max_seq_len // compressed, bias=False)
             self.attn = MultiheadLinearAttention(
                 embed_dim,
@@ -567,7 +575,7 @@ class EfficientParticleTransformer(nn.Module):
             x, v, mask, uu = self.trimmer(x, v, mask, uu)
             padding_mask = ~mask.squeeze(1)  # (N, P)
 
-        with torch.cuda.amp.autocast(enabled=self.use_amp):
+        with torch.amp.autocast("cuda", enabled=self.use_amp):
             x_in = x if self.pair_more_input_dim > 0 else None
             # input embedding
             x = self.embed(x).masked_fill(~mask.permute(2, 0, 1), 0)  # (P, N, C)
@@ -683,7 +691,7 @@ class EfficientParticleTransformerTagger(nn.Module):
             v = torch.cat([pf_v, sv_v], dim=2)
             mask = torch.cat([pf_mask, sv_mask], dim=2)
 
-        with torch.cuda.amp.autocast(enabled=self.use_amp):
+        with torch.amp.autocast("cuda", enabled=self.use_amp):
             pf_x = self.pf_embed(pf_x)  # after embed: (seq_len, batch, embed_dim)
             sv_x = self.sv_embed(sv_x)
             x = torch.cat([pf_x, sv_x], dim=0)
