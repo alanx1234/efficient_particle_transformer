@@ -3,8 +3,7 @@ from networks.parT import ParticleTransformer
 from networks.logger import _logger
 
 '''
-Link to the full model implementation:
-https://github.com/hqucms/weaver-core/blob/main/weaver/nn/model/ParticleTransformer.py
+Particle Transformer with Geometric Message Passing (GMP)
 '''
 
 
@@ -41,8 +40,13 @@ def get_model(data_config, **kwargs):
         # misc
         trim=True,
         for_inference=False,
+        use_gmp = True,
+        gmp_kernel = 3,
+        gmp_grid = 0.05,
+        gmp_reduce = "sum",
     )
     cfg.update(**kwargs)
+    cfg["use_gmp"] = True
     _logger.info('Model config: %s' % str(cfg))
 
     model = ParticleTransformerWrapper(**cfg)
