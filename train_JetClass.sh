@@ -50,6 +50,9 @@ elif [[ "$model" == "MorePairAttnParT" ]]; then
 elif [[ "$model" == "ParT" ]]; then
     modelopts="networks/example_ParticleTransformer.py --use-amp"
     batchopts="--batch-size 512 --start-lr 1e-3"
+elif [[ "$model" == "ParTGMP" ]]; then
+    modelopts="networks/example_ParticleTransformerGMP.py --use-amp"
+    batchopts="--batch-size 512 --start-lr 1e-3"
 elif [[ "$model" == "ParTNoPairs" ]]; then
     modelopts="networks/example_ParticleTransformerNoPairs.py --use-amp"
     batchopts="--batch-size 512 --start-lr 1e-3"

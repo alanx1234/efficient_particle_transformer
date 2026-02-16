@@ -605,11 +605,11 @@ class ParticleTransformer(nn.Module):
                  use_amp=False,
                  use_gmp = False,
                  gmp_kernel = 3,
-                 gmp_grid = 0.05,
+                 gmp_grid = 0.2,
                  gmp_reduce = "sum",
                  **kwargs) -> None:
         super().__init__(**kwargs)
- 
+
         self.trimmer = SequenceTrimmer(enabled=trim and not for_inference)
         self.for_inference = for_inference
         self.use_amp = use_amp
@@ -625,6 +625,8 @@ class ParticleTransformer(nn.Module):
                 grid_size=gmp_grid,
                 scatter_reduce=gmp_reduce,
             )
+
+        _logger.info(f"GMP ENABLED: use_gmp={use_gmp}, grid={gmp_grid}, kernel={gmp_kernel}")
 
         default_cfg = dict(embed_dim=embed_dim, num_heads=num_heads, ffn_ratio=4,
                            dropout=0.1, attn_dropout=0.1, activation_dropout=0.1,
