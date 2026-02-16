@@ -314,7 +314,7 @@ class LinBlock(nn.Module):
         embed_dim=128,
         num_heads=8,
         max_seq_len=128,
-        attn_type="pairs",
+        attn_type="linformer",
         compressed=4,
         bucket_size=32,
         n_hashes=4,
