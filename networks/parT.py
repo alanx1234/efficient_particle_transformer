@@ -455,7 +455,7 @@ class Block(nn.Module):
         x += residual
 
         return x
-class GeometricMessagePassingTorch(nn.Module):
+class GeometricMessagePassing(nn.Module):
     def __init__(
         self,
         channels: int,
@@ -482,35 +482,28 @@ class GeometricMessagePassingTorch(nn.Module):
         self.pointwise = nn.Linear(channels, channels, bias=True)
         self.norm = nn.LayerNorm(channels, eps=1e-6)
 
-    def forward(self, x: torch.Tensor, eta: torch.Tensor, phi: torch.Tensor, pad: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor,  c1: torch.Tensor, c2: torch.Tensor, pad: torch.Tensor | None = None) -> torch.Tensor:
         B, P, C = x.shape
         assert C == self.channels
         residual = x
 
-        phi = unwrap_phi_per_jet(phi, pad=pad)
-
         if pad is not None:
-            eta_for_min = eta.masked_fill(pad, float("inf"))
-            phi_for_min = phi.masked_fill(pad, float("inf"))
-            eta_min = eta_for_min.min(dim=1, keepdim=True).values
-            phi_min = phi_for_min.min(dim=1, keepdim=True).values
+            c1_for_min = c1.masked_fill(pad, float("inf"))
+            c2_for_min = c2.masked_fill(pad, float("inf"))
+            c1_min = c1_for_min.min(dim=1, keepdim=True).values
+            c2_min = c2_for_min.min(dim=1, keepdim=True).values
 
-            eta_min = torch.where(torch.isfinite(eta_min), eta_min, torch.zeros_like(eta_min))
-            phi_min = torch.where(torch.isfinite(phi_min), phi_min, torch.zeros_like(phi_min))
+            c1_min = torch.where(torch.isfinite(c1_min), c1_min, torch.zeros_like(c1_min))
+            c2_min = torch.where(torch.isfinite(c2_min), c2_min, torch.zeros_like(c2_min))
 
-            eta_shift = eta - eta_min
-            phi_shift = phi - phi_min
-
-            eta_shift = eta_shift.masked_fill(pad, 0.0)
-            phi_shift = phi_shift.masked_fill(pad, 0.0)
+            c1_shift = (c1 - c1_min).masked_fill(pad, 0.0)
+            c2_shift = (c2 - c2_min).masked_fill(pad, 0.0)
         else:
-            eta_min = eta.min(dim=1, keepdim=True).values
-            phi_min = phi.min(dim=1, keepdim=True).values
-            eta_shift = eta - eta_min
-            phi_shift = phi - phi_min
+            c1_shift = c1 - c1.min(dim=1, keepdim=True).values
+            c2_shift = c2 - c2.min(dim=1, keepdim=True).values
 
-        grid_eta = (eta_shift / self.grid_size).floor().to(torch.long)  # [B,P]
-        grid_phi = (phi_shift / self.grid_size).floor().to(torch.long)  # [B,P]
+        grid_eta = (c1_shift / self.grid_size).floor().to(torch.long) # [B,P]
+        grid_phi = (c2_shift / self.grid_size).floor().to(torch.long) # [B,P]
 
         H = int(grid_eta.max().item()) + 1
         W = int(grid_phi.max().item()) + 1
@@ -603,6 +596,7 @@ class ParticleTransformer(nn.Module):
                  trim=True,
                  for_inference=False,
                  use_amp=False,
+                 gmp_coords = "raw",
                  use_gmp = False,
                  gmp_kernel = 3,
                  gmp_grid = 0.2,
@@ -616,17 +610,18 @@ class ParticleTransformer(nn.Module):
 
         embed_dim = embed_dims[-1] if len(embed_dims) > 0 else input_dim
 
+        self.gmp_coords = gmp_coords
         self.use_gmp = use_gmp
         self.gmp = None
         if self.use_gmp:
-            self.gmp = GeometricMessagePassingTorch(
+            self.gmp = GeometricMessagePassing(
                 channels=embed_dim,
                 kernel_size=gmp_kernel,
                 grid_size=gmp_grid,
                 scatter_reduce=gmp_reduce,
             )
 
-        _logger.info(f"GMP ENABLED: use_gmp={use_gmp}, grid={gmp_grid}, kernel={gmp_kernel}")
+        _logger.info(f"GMP ENABLED: use_gmp={use_gmp}, grid={gmp_grid}, coords={gmp_coords}, kernel={gmp_kernel}")
 
         default_cfg = dict(embed_dim=embed_dim, num_heads=num_heads, ffn_ratio=4,
                            dropout=0.1, attn_dropout=0.1, activation_dropout=0.1,
@@ -694,7 +689,18 @@ class ParticleTransformer(nn.Module):
                 x_bpc = x.permute(1, 0, 2).contiguous()  # (N,P,C)
                 eta, phi = compute_eta_phi_from_p4(v)    # (N,P), (N,P)
                 pad = ~mask.squeeze(1)                   # (N,P) True where padded
-                x_bpc = self.gmp(x_bpc, eta, phi, pad=pad)
+
+                phi_centered = unwrap_phi_per_jet(phi, pad=pad)
+
+                if self.gmp_coords == "pt":
+                    px, py = v[:, 0, :], v[:, 1, :]
+                    pt = torch.sqrt(px * px + py * py + 1e-8)
+                    c1, c2 = pt * eta, pt * phi_centered
+                else:
+                    c1, c2 = eta, phi_centered
+
+                
+                x_bpc = self.gmp(x_bpc, c1, c2, pad=pad)
                 x = x_bpc.permute(1, 0, 2).contiguous()  # back to (P,N,C)
             
             if v is not None and self.pair_embed is not None:
@@ -749,6 +755,7 @@ class ParticleTransformerTagger(nn.Module):
                  for_inference=False,
                  use_amp=False,
                  use_gmp = False,
+                 gmp_coords = "raw",
                  gmp_kernel = 3,
                  gmp_grid = 0.05,
                  gmp_reduce = "sum",
@@ -784,6 +791,7 @@ class ParticleTransformerTagger(nn.Module):
                                         for_inference=for_inference,
                                         use_amp=use_amp,
                                         use_gmp=use_gmp,
+                                        gmp_coords=gmp_coords,
                                         gmp_kernel=gmp_kernel,
                                         gmp_grid=gmp_grid,
                                         gmp_reduce=gmp_reduce,)
