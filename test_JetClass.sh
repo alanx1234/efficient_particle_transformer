@@ -35,6 +35,9 @@ if [[ "$model" == "ParT" ]]; then
 elif [[ "$model" == "ParTGMP" ]]; then
     modelopts="networks/example_ParticleTransformerGMP.py --use-amp"
     batchopts="--batch-size 512 --start-lr 1e-3"
+elif [[ "$model" == "ParTGMP_pt" ]]; then
+    modelopts="networks/example_ParticleTransformerptGMP.py --use-amp"
+    batchopts="--batch-size 512 --start-lr 1e-3"
 elif [[ "$model" == "LinformerParT" ]]; then
     modelopts="networks/example_LinformerParticleTransformer.py --use-amp"
     batchopts="--batch-size 512 --start-lr 1e-3"
