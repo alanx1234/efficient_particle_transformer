@@ -191,7 +191,7 @@ class SequenceTrimmer(nn.Module):
         self.target = target
         self._counter = 0
 
-    def forward(self, x, v=None, mask=None, uu=None):
+    def forward(self, x, v=None, mask=None, uu=None, points=None):
         # x: (N, C, P)
         # v: (N, 4, P) [px,py,pz,energy]
         # mask: (N, 1, P) -- real particle = 1, padded = 0
@@ -217,6 +217,8 @@ class SequenceTrimmer(nn.Module):
                     if uu is not None:
                         uu = torch.gather(uu, -2, perm.unsqueeze(-1).expand_as(uu))
                         uu = torch.gather(uu, -1, perm.unsqueeze(-2).expand_as(uu))
+                    if points is not None:
+                        points = torch.gather(points, -1, perm.expand_as(points))
                 else:
                     maxlen = mask.sum(dim=-1).max()
                 maxlen = max(maxlen, 1)
@@ -227,8 +229,10 @@ class SequenceTrimmer(nn.Module):
                         v = v[:, :, :maxlen]
                     if uu is not None:
                         uu = uu[:, :, :maxlen, :maxlen]
+                    if points is not None:
+                        points = points[:, :, :maxlen]
 
-        return x, v, mask, uu
+        return x, v, mask, uu, points
 
 
 class Embed(nn.Module):
@@ -667,7 +671,7 @@ class ParticleTransformer(nn.Module):
     def no_weight_decay(self):
         return {'cls_token', }
 
-    def forward(self, x, v=None, mask=None, uu=None, uu_idx=None):
+    def forward(self, x, v=None, mask=None, uu=None, uu_idx=None, points=None):
         # x: (N, C, P)
         # v: (N, 4, P) [px,py,pz,energy]
         # mask: (N, 1, P) -- real particle = 1, padded = 0
@@ -678,7 +682,7 @@ class ParticleTransformer(nn.Module):
             if not self.for_inference:
                 if uu_idx is not None:
                     uu = build_sparse_tensor(uu, uu_idx, x.size(-1))
-            x, v, mask, uu = self.trimmer(x, v, mask, uu)
+            x, v, mask, uu, points = self.trimmer(x, v, mask, uu, points=points)
             padding_mask = ~mask.squeeze(1)  # (N, P)
 
         with torch.amp.autocast('cuda', enabled=self.use_amp):
@@ -686,22 +690,24 @@ class ParticleTransformer(nn.Module):
             x = self.embed(x).masked_fill(~mask.permute(2, 0, 1), 0)  # (P, N, C)
 
             if self.gmp is not None and (v is not None):
-                x_bpc = x.permute(1, 0, 2).contiguous()  # (N,P,C)
-                eta, phi = compute_eta_phi_from_p4(v)    # (N,P), (N,P)
-                pad = ~mask.squeeze(1)                   # (N,P) True where padded
-
-                phi_centered = unwrap_phi_per_jet(phi, pad=pad)
-
-                if self.gmp_coords == "pt":
-                    px, py = v[:, 0, :], v[:, 1, :]
-                    pt = torch.sqrt(px * px + py * py + 1e-8)
-                    c1, c2 = pt * eta, pt * phi_centered
+                x_bpc = x.permute(1, 0, 2).contiguous()
+                pad = ~mask.squeeze(1)
+            
+                if self.gmp_coords == "relative" and points is not None:
+                    c1 = points[:, 0, :]  # part_deta (N, P)
+                    c2 = points[:, 1, :]  # part_dphi (N, P)
                 else:
-                    c1, c2 = eta, phi_centered
-
-                
+                    eta, phi = compute_eta_phi_from_p4(v)
+                    phi_centered = unwrap_phi_per_jet(phi, pad=pad)
+                    if self.gmp_coords == "pt":
+                        px, py = v[:, 0, :], v[:, 1, :]
+                        pt = torch.sqrt(px*px + py*py + 1e-8)
+                        c1, c2 = pt * eta, pt * phi_centered
+                    else:
+                        c1, c2 = eta, phi_centered
+            
                 x_bpc = self.gmp(x_bpc, c1, c2, pad=pad)
-                x = x_bpc.permute(1, 0, 2).contiguous()  # back to (P,N,C)
+                x = x_bpc.permute(1, 0, 2).contiguous() # back to (P,N,C)
             
             if v is not None and self.pair_embed is not None:
                 v = v.masked_fill(~mask.expand_as(v), 0.0)
@@ -806,8 +812,8 @@ class ParticleTransformerTagger(nn.Module):
         # mask: (N, 1, P) -- real particle = 1, padded = 0
 
         with torch.no_grad():
-            pf_x, pf_v, pf_mask, _ = self.pf_trimmer(pf_x, pf_v, pf_mask)
-            sv_x, sv_v, sv_mask, _ = self.sv_trimmer(sv_x, sv_v, sv_mask)
+            pf_x, pf_v, pf_mask, _, _ = self.pf_trimmer(pf_x, pf_v, pf_mask)
+            sv_x, sv_v, sv_mask, _, _ = self.sv_trimmer(sv_x, sv_v, sv_mask)
             v = torch.cat([pf_v, sv_v], dim=2)
             mask = torch.cat([pf_mask, sv_mask], dim=2)
 
@@ -890,8 +896,8 @@ class ParticleTransformerTaggerWithExtraPairFeatures(nn.Module):
                 if pf_uu_idx is not None:
                     pf_uu = build_sparse_tensor(pf_uu, pf_uu_idx, pf_x.size(-1))
 
-            pf_x, pf_v, pf_mask, pf_uu = self.pf_trimmer(pf_x, pf_v, pf_mask, pf_uu)
-            sv_x, sv_v, sv_mask, _ = self.sv_trimmer(sv_x, sv_v, sv_mask)
+            pf_x, pf_v, pf_mask, pf_uu, _ = self.pf_trimmer(pf_x, pf_v, pf_mask, pf_uu)
+            sv_x, sv_v, sv_mask, _, _ = self.sv_trimmer(sv_x, sv_v, sv_mask)
             v = torch.cat([pf_v, sv_v], dim=2)
             mask = torch.cat([pf_mask, sv_mask], dim=2)
             uu = torch.zeros(v.size(0), pf_uu.size(1), v.size(2), v.size(2), dtype=v.dtype, device=v.device)
