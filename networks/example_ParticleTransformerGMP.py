@@ -17,7 +17,7 @@ class ParticleTransformerWrapper(torch.nn.Module):
         return {'mod.cls_token', }
 
     def forward(self, points, features, lorentz_vectors, mask):
-        return self.mod(features, v=lorentz_vectors, mask=mask)
+        return self.mod(features, v=lorentz_vectors, mask=mask, points=points)
 
 
 def get_model(data_config, **kwargs):
