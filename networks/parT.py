@@ -464,85 +464,117 @@ class GeometricMessagePassing(nn.Module):
         self,
         channels: int,
         kernel_size: int = 3,
-        grid_size: float = 0.05,
-        scatter_reduce: str = "sum",   # "sum" or "mean"
+        grid_sizes: list = [0.05],        # list of grid sizes, one per scale
+        scatter_reduce: str = "sum",       # "sum" or "mean"
+        max_delta_r: float = 0.8,          # physical jet radius cap (AK8 = 0.8)
         eps: float = 1e-6,
     ):
         super().__init__()
         assert scatter_reduce in ("sum", "mean")
         self.channels = channels
         self.kernel_size = kernel_size
-        self.grid_size = float(grid_size)
+        self.grid_sizes = [float(g) for g in grid_sizes]
         self.scatter_reduce = scatter_reduce
+        self.max_delta_r = max_delta_r
         self.eps = eps
-
-        self.conv2d = nn.Conv2d(
-            channels, channels,
-            kernel_size=kernel_size,
-            padding=kernel_size // 2,
-            groups=channels,
-            bias=True,
-        )
-        self.pointwise = nn.Linear(channels, channels, bias=True)
+ 
+        K = len(self.grid_sizes)
+ 
+        # one depthwise conv2d per scale, they specialise independently
+        self.conv2ds = nn.ModuleList([
+            nn.Conv2d(
+                channels, channels,
+                kernel_size=kernel_size,
+                padding=kernel_size // 2,
+                groups=channels,
+                bias=True,
+            )
+            for _ in range(K)
+        ])
+ 
+        # project concat of all scale outputs [K*C] -> [C]
+        self.proj = nn.Linear(K * channels, channels, bias=True)
         self.norm = nn.LayerNorm(channels, eps=1e-6)
-
-    def forward(self, x: torch.Tensor,  c1: torch.Tensor, c2: torch.Tensor, pad: torch.Tensor | None = None) -> torch.Tensor:
+ 
+    def _single_scale_forward(
+        self,
+        x: torch.Tensor,           # [B, P, C]
+        c1_shift: torch.Tensor,    # [B, P] already min-shifted & pad-zeroed
+        c2_shift: torch.Tensor,    # [B, P]
+        pad: torch.Tensor,         # [B, P] bool, True = padded
+        grid_size: float,
+        conv2d: nn.Conv2d,
+    ) -> torch.Tensor:              # [B, P, C]
         B, P, C = x.shape
-        assert C == self.channels
-        residual = x
-
-        if pad is not None:
-            c1_for_min = c1.masked_fill(pad, float("inf"))
-            c2_for_min = c2.masked_fill(pad, float("inf"))
-            c1_min = c1_for_min.min(dim=1, keepdim=True).values
-            c2_min = c2_for_min.min(dim=1, keepdim=True).values
-
-            c1_min = torch.where(torch.isfinite(c1_min), c1_min, torch.zeros_like(c1_min))
-            c2_min = torch.where(torch.isfinite(c2_min), c2_min, torch.zeros_like(c2_min))
-
-            c1_shift = (c1 - c1_min).masked_fill(pad, 0.0)
-            c2_shift = (c2 - c2_min).masked_fill(pad, 0.0)
-        else:
-            c1_shift = c1 - c1.min(dim=1, keepdim=True).values
-            c2_shift = c2 - c2.min(dim=1, keepdim=True).values
-
-        grid_eta = (c1_shift / self.grid_size).floor().to(torch.long) # [B,P]
-        grid_phi = (c2_shift / self.grid_size).floor().to(torch.long) # [B,P]
-
-        H = int(grid_eta.max().item()) + 1
-        W = int(grid_phi.max().item()) + 1
-
-        H = max(H, 1)
-        W = max(W, 1)
-
-        grid_eta = grid_eta.clamp(0, H - 1)
-        grid_phi = grid_phi.clamp(0, W - 1)
-
+ 
+        # cap grid to physical jet radius -- same ΔR coverage for every scale
+        max_cells = max(1, int(self.max_delta_r / grid_size))
+ 
+        grid_eta = (c1_shift / grid_size).floor().to(torch.long).clamp(0, max_cells - 1)
+        grid_phi = (c2_shift / grid_size).floor().to(torch.long).clamp(0, max_cells - 1)
+ 
+        H, W = max_cells, max_cells
         HW = H * W
-        b_idx = torch.arange(B, device=x.device).view(B, 1).expand(B, P)  # [B,P]
+ 
+        b_idx = torch.arange(B, device=x.device).view(B, 1).expand(B, P)  # [B, P]
         flat_idx = (b_idx * HW + grid_eta * W + grid_phi).reshape(-1)      # [B*P]
-
-        # Scatter into grid_flat: [B*H*W, C]
+ 
+        # scatter: accumulate particle features into grid cells
         grid_flat = x.new_zeros((B * HW, C))
         grid_flat.scatter_add_(0, flat_idx[:, None].expand(-1, C), x.reshape(-1, C))
-
+ 
         if self.scatter_reduce == "mean":
             ones = x.new_ones((B * P,))
             counts = x.new_zeros((B * HW,))
             counts.scatter_add_(0, flat_idx, ones)
             grid_flat = grid_flat / (counts[:, None] + self.eps)
-
-        # Conv: [B,C,H,W]
+ 
+        # conv: [B, C, H, W]
         grid = grid_flat.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
-        grid = self.conv2d(grid)
-
-        # Gather back: [B,P,C]
+        grid = conv2d(grid)
+ 
+        # gather back: each particle reads from its cell
         grid_bhwc = grid.permute(0, 2, 3, 1).contiguous()
-        out = grid_bhwc[b_idx, grid_eta, grid_phi]
-
-        out = self.pointwise(out)
+        out = grid_bhwc[b_idx, grid_eta, grid_phi]  # [B, P, C]
+        return out
+ 
+    def forward(
+        self,
+        x: torch.Tensor,
+        c1: torch.Tensor,
+        c2: torch.Tensor,
+        pad: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        B, P, C = x.shape
+        assert C == self.channels
+        residual = x
+ 
+        # shift coords so the closest real particle sits at the grid origin
+        if pad is not None:
+            c1_for_min = c1.masked_fill(pad, float("inf"))
+            c2_for_min = c2.masked_fill(pad, float("inf"))
+            c1_min = c1_for_min.min(dim=1, keepdim=True).values
+            c2_min = c2_for_min.min(dim=1, keepdim=True).values
+            c1_min = torch.where(torch.isfinite(c1_min), c1_min, torch.zeros_like(c1_min))
+            c2_min = torch.where(torch.isfinite(c2_min), c2_min, torch.zeros_like(c2_min))
+            c1_shift = (c1 - c1_min).masked_fill(pad, 0.0)
+            c2_shift = (c2 - c2_min).masked_fill(pad, 0.0)
+        else:
+            c1_shift = c1 - c1.min(dim=1, keepdim=True).values
+            c2_shift = c2 - c2.min(dim=1, keepdim=True).values
+ 
+        # run all scales in parallel, gather outputs
+        scale_outs = [
+            self._single_scale_forward(x, c1_shift, c2_shift, pad, gs, conv)
+            for gs, conv in zip(self.grid_sizes, self.conv2ds)
+        ]
+ 
+        # concat [B, P, K*C] -> project -> [B, P, C] -> residual
+        out = torch.cat(scale_outs, dim=-1)
+        out = self.proj(out)
         out = self.norm(out)
         return residual + out
+
 
 def compute_eta_phi_from_p4(v: torch.Tensor, eps: float = 1e-8):
     """
@@ -603,7 +635,8 @@ class ParticleTransformer(nn.Module):
                  gmp_coords = "raw",
                  use_gmp = False,
                  gmp_kernel = 3,
-                 gmp_grid = 0.2,
+                 gmp_grids = [0.025, 0.05, 0.1, 0.2],
+                 gmp_max_delta_r = 0.8,
                  gmp_reduce = "sum",
                  **kwargs) -> None:
         super().__init__(**kwargs)
@@ -621,11 +654,12 @@ class ParticleTransformer(nn.Module):
             self.gmp = GeometricMessagePassing(
                 channels=embed_dim,
                 kernel_size=gmp_kernel,
-                grid_size=gmp_grid,
+                grid_sizes=gmp_grids,
                 scatter_reduce=gmp_reduce,
+                max_delta_r=gmp_max_delta_r,
             )
 
-        _logger.info(f"GMP ENABLED: use_gmp={use_gmp}, grid={gmp_grid}, coords={gmp_coords}, kernel={gmp_kernel}")
+        _logger.info(f"GMP ENABLED: use_gmp={use_gmp}, grid={gmp_grids}, coords={gmp_coords}, kernel={gmp_kernel}")
 
         default_cfg = dict(embed_dim=embed_dim, num_heads=num_heads, ffn_ratio=4,
                            dropout=0.1, attn_dropout=0.1, activation_dropout=0.1,
