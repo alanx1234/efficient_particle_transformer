@@ -575,8 +575,12 @@ class GeometricMessagePassing(nn.Module):
         # log mean scale weights for diagnostics
         if not self.training:
             with torch.no_grad():
-                w_log = weights.squeeze(-1).mean(dim=(0, 1))  # [K]
-                _logger.info(f"GMP scale weights (mean over B,P): {w_log.cpu().numpy()} | grid_sizes={self.grid_sizes}")
+                if not hasattr(self, '_log_counter'):
+                    self._log_counter = 0
+                if self._log_counter < 5:
+                    w_log = weights.squeeze(-1).mean(dim=(0, 1))  # [K]
+                    _logger.info(f"GMP scale weights (mean over B,P): {w_log.cpu().numpy()} | grid_sizes={self.grid_sizes}")
+                    self._log_counter += 1
 
         # stack scale outputs: [B, P, K, C], weighted sum -> [B, P, C]
         stacked = torch.stack(scale_outs, dim=2)  # [B, P, K, C]
