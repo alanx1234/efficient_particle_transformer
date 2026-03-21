@@ -572,6 +572,11 @@ class GeometricMessagePassing(nn.Module):
         # per-particle learned scale weights from the *input* embedding
         # x: [B, P, C] -> scores: [B, P, K] -> weights: [B, P, K, 1]
         weights = self.scale_attn(x).softmax(dim=-1).unsqueeze(-1)
+        # log mean scale weights for diagnostics
+        if not self.training:
+            with torch.no_grad():
+                w_log = weights.squeeze(-1).mean(dim=(0, 1))  # [K]
+                _logger.info(f"GMP scale weights (mean over B,P): {w_log.cpu().numpy()} | grid_sizes={self.grid_sizes}")
 
         # stack scale outputs: [B, P, K, C], weighted sum -> [B, P, C]
         stacked = torch.stack(scale_outs, dim=2)  # [B, P, K, C]
