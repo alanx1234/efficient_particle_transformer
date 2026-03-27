@@ -400,28 +400,6 @@ class Block(nn.Module):
 
 
 class PatchAttentionBlock(nn.Module):
-    """
-    PHAT-JeT style block matching PTv3Block from the actual implementation.
-
-    Per-block order (matching PTv3Block.call):
-      1. GMP  -- called with pre-computed coords passed in from forward()
-      2. norm1 -> intra-patch MHA -> residual add
-      3. patch message: mean-pool patches -> MHA over patch tokens ->
-                        optional linear proj -> broadcast back residually
-      4. norm2 -> FFN -> residual add
-
-    Key differences from vanilla Block:
-      - No interaction matrix (pair_embed) at any point
-      - GMP runs every block (not just once upfront)
-      - Attention is local within patches of size `patch_size`
-      - Global info exchanged via lightweight patch-token MHA + broadcast
-
-    Args:
-        patch_size: particles per patch; sequence zero-padded to a multiple
-        use_patch_messages: toggle hierarchical global stage (default True)
-        message_proj: learned linear on patch message before broadcast (default True)
-        All other args match Block exactly.
-    """
     def __init__(self, embed_dim=128, num_heads=8, ffn_ratio=4,
                  dropout=0.1, attn_dropout=0.1, activation_dropout=0.1,
                  add_bias_kv=False, activation='gelu',
@@ -505,14 +483,6 @@ class PatchAttentionBlock(nn.Module):
 
     def forward(self, x, x_cls=None, padding_mask=None, attn_mask=None,
                 gmp=None, gmp_coords=None):
-        """
-        x:            (P_orig, N, C)
-        padding_mask: (N, P_orig)  True = padded
-        gmp:          GeometricMessagePassing module or None
-        gmp_coords:   (c1, c2) tuple of (N, P) tensors, pre-computed in ParticleTransformer.forward
-        attn_mask:    ignored (no interaction matrix in phat mode)
-        x_cls:        ignored (cls_blocks use vanilla Block, not PatchAttentionBlock)
-        """
         P_orig, N, C = x.shape
         P = self.patch_size
 
