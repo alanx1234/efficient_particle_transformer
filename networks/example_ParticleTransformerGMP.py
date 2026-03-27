@@ -16,7 +16,7 @@ class ParticleTransformerWrapper(torch.nn.Module):
     def no_weight_decay(self):
         return {'mod.cls_token', }
 
-    def forward(self, features, lorentz_vectors, mask):
+    def forward(self, points, features, lorentz_vectors, mask):
         return self.mod(features, v=lorentz_vectors, mask=mask)
 
 
@@ -41,7 +41,7 @@ def get_model(data_config, **kwargs):
         trim=True,
         for_inference=False,
         use_gmp = True,
-        gmp_coords = "relative",
+        gmp_coords = "raw",
         gmp_kernel = 3,
         gmp_grid = 0.05,
         gmp_reduce = "sum",
