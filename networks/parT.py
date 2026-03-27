@@ -665,6 +665,39 @@ def unwrap_phi_per_jet(phi: torch.Tensor, pad: torch.Tensor | None = None) -> to
     return wrap_to_pi(phi - phi0)
 
 
+def sort_by_pt(x: torch.Tensor, v: torch.Tensor, padding_mask: torch.Tensor):
+    """
+    Sort particles by pt descending, padding masked particles to the end.
+    x:            (P, N, C)
+    v:            (N, 4, P)
+    padding_mask: (N, P) True = padded
+    Returns sorted x, v, padding_mask.
+    """
+    # compute pt from v: (N, P)
+    px, py = v[:, 0, :], v[:, 1, :]
+    pt = torch.sqrt(px * px + py * py)
+
+    # set padded particle pt to -1 so they sort to the end
+    pt = pt.masked_fill(padding_mask, -1.0)
+
+    # argsort descending: (N, P)
+    sort_idx = pt.argsort(dim=1, descending=True)  # (N, P)
+
+    # reorder v: (N, 4, P)
+    v = torch.gather(v, 2, sort_idx.unsqueeze(1).expand_as(v))
+
+    # reorder x: (P, N, C) -> gather along dim 0 using (N, P) -> need (P, N, C)
+    # transpose to (N, P, C), gather, transpose back
+    x = x.permute(1, 0, 2)                                         # (N, P, C)
+    x = torch.gather(x, 1, sort_idx.unsqueeze(-1).expand_as(x))    # (N, P, C)
+    x = x.permute(1, 0, 2)                                         # (P, N, C)
+
+    # reorder padding_mask: (N, P)
+    padding_mask = torch.gather(padding_mask, 1, sort_idx)
+
+    return x, v, padding_mask
+
+
 class ParticleTransformer(nn.Module):
 
     def __init__(self,
@@ -701,6 +734,7 @@ class ParticleTransformer(nn.Module):
                  phat_use_patch_messages=True,
                  phat_message_proj=True,
                  phat_gmp_per_block=False,
+                 phat_sort=True,       # sort by pt before patching (default on)
                  # standard parT GMP per block (independent of phat)
                  gmp_per_block=False,
                  **kwargs) -> None:
@@ -713,6 +747,7 @@ class ParticleTransformer(nn.Module):
         self.gmp_coords = gmp_coords
         self.phat_gmp_per_block = phat_gmp_per_block
         self.gmp_per_block = gmp_per_block
+        self.phat_sort = phat_sort
 
         self.trimmer = SequenceTrimmer(enabled=trim and not for_inference)
 
@@ -806,6 +841,11 @@ class ParticleTransformer(nn.Module):
             x = self.embed(x).masked_fill(~mask.permute(2, 0, 1), 0)
 
             if self.use_phat:
+                # sort by pt descending before patching so high-pt subjet
+                # cores land in the same patch (toggled via phat_sort)
+                if self.phat_sort and v is not None:
+                    x, v, padding_mask = sort_by_pt(x, v, padding_mask)
+
                 # compute gmp coords (needed for both upfront and per-block modes)
                 gmp_coords = None
                 if self.gmp is not None and v is not None:
@@ -821,7 +861,7 @@ class ParticleTransformer(nn.Module):
                     gmp_coords = (c1, c2)
 
                 if self.gmp is not None and not self.phat_gmp_per_block:
-                    # GMP once upfront before block loop (default, matches our existing GMP+ParT)
+                    # GMP once upfront before block loop (default)
                     x_bpc = x.permute(1, 0, 2).contiguous()
                     x_bpc = self.gmp(x_bpc, gmp_coords[0], gmp_coords[1], pad=padding_mask)
                     x = x_bpc.permute(1, 0, 2).contiguous()
@@ -922,6 +962,7 @@ class ParticleTransformerTagger(nn.Module):
                  phat_use_patch_messages=True,
                  phat_message_proj=True,
                  phat_gmp_per_block=False,
+                 phat_sort=True,
                  gmp_per_block=False,
                  **kwargs) -> None:
         super().__init__(**kwargs)
@@ -963,6 +1004,7 @@ class ParticleTransformerTagger(nn.Module):
                                         phat_use_patch_messages=phat_use_patch_messages,
                                         phat_message_proj=phat_message_proj,
                                         phat_gmp_per_block=phat_gmp_per_block,
+                                        phat_sort=phat_sort,
                                         gmp_per_block=gmp_per_block)
 
     @torch.jit.ignore
