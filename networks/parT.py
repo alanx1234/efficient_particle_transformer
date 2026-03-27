@@ -447,6 +447,14 @@ class PatchAttentionBlock(nn.Module):
         """
         residual = x
         xn = self.norm1(x)
+
+        # guard against fully-padded patches: softmax(-inf) = NaN
+        # force position 0 unmasked for any all-padded patch
+        if pm is not None:
+            all_masked = pm.all(dim=1, keepdim=True)   # (NP*N, 1)
+            pm = pm.clone()
+            pm[:, :1] = pm[:, :1] & ~all_masked        # unmask pos 0 for fully-padded patches
+
         xn, _ = self.attn(xn, xn, xn, key_padding_mask=pm)
 
         if self.c_attn is not None:
@@ -869,15 +877,13 @@ class ParticleTransformer(nn.Module):
                 else:
                     gmp_pass = self.gmp  # blocks will call GMP themselves each time
 
-                for i, block in enumerate(self.blocks):
+                for block in self.blocks:
                     x = block(
                         x,
                         padding_mask=padding_mask,
                         gmp=gmp_pass,
                         gmp_coords=gmp_coords,
                     )
-                    if i == 0:
-                        _logger.info(f"post-block-0 x isnan: {x.isnan().any()}, isinf: {x.isinf().any()}")
 
             else:
                 # standard parT: GMP then global attention + pair_embed
