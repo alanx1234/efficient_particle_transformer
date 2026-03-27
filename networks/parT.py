@@ -869,13 +869,15 @@ class ParticleTransformer(nn.Module):
                 else:
                     gmp_pass = self.gmp  # blocks will call GMP themselves each time
 
-                for block in self.blocks:
+                for i, block in enumerate(self.blocks):
                     x = block(
                         x,
                         padding_mask=padding_mask,
                         gmp=gmp_pass,
                         gmp_coords=gmp_coords,
                     )
+                    if i == 0:
+                        _logger.info(f"post-block-0 x isnan: {x.isnan().any()}, isinf: {x.isinf().any()}")
 
             else:
                 # standard parT: GMP then global attention + pair_embed
