@@ -565,6 +565,7 @@ class GeometricMessagePassing(nn.Module):
         kernel_size: int = 3,
         grid_size: float = 0.05,
         scatter_reduce: str = "sum",
+        max_delta_r: float = 0.8,
         eps: float = 1e-6,
     ):
         super().__init__()
@@ -573,6 +574,7 @@ class GeometricMessagePassing(nn.Module):
         self.kernel_size = kernel_size
         self.grid_size = float(grid_size)
         self.scatter_reduce = scatter_reduce
+        self.max_delta_r = max_delta_r
         self.eps = eps
 
         self.conv2d = nn.Conv2d(
@@ -604,16 +606,13 @@ class GeometricMessagePassing(nn.Module):
             c1_shift = c1 - c1.min(dim=1, keepdim=True).values
             c2_shift = c2 - c2.min(dim=1, keepdim=True).values
 
-        grid_eta = (c1_shift / self.grid_size).floor().to(torch.long)
-        grid_phi = (c2_shift / self.grid_size).floor().to(torch.long)
+        # cap grid dims to max_delta_r/grid_size — fixes H,W at a constant size
+        # so conv2d always operates on the same shape, removing dynamic resizing overhead
+        max_cells = max(1, int(self.max_delta_r / self.grid_size))
+        H, W = max_cells, max_cells
 
-        H = int(grid_eta.max().item()) + 1
-        W = int(grid_phi.max().item()) + 1
-        H = max(H, 1)
-        W = max(W, 1)
-
-        grid_eta = grid_eta.clamp(0, H - 1)
-        grid_phi = grid_phi.clamp(0, W - 1)
+        grid_eta = (c1_shift / self.grid_size).floor().to(torch.long).clamp(0, H - 1)
+        grid_phi = (c2_shift / self.grid_size).floor().to(torch.long).clamp(0, W - 1)
 
         HW = H * W
         b_idx = torch.arange(B, device=x.device).view(B, 1).expand(B, P)
@@ -695,6 +694,7 @@ class ParticleTransformer(nn.Module):
                  gmp_kernel=3,
                  gmp_grid=0.05,
                  gmp_reduce="sum",
+                 gmp_max_delta_r=0.8,
                  # PHAT
                  use_phat=False,
                  phat_patch_size=10,
@@ -726,8 +726,9 @@ class ParticleTransformer(nn.Module):
                 kernel_size=gmp_kernel,
                 grid_size=gmp_grid,
                 scatter_reduce=gmp_reduce,
+                max_delta_r=gmp_max_delta_r,
             )
-        _logger.info(f"GMP: use_gmp={use_gmp}, grid={gmp_grid}, coords={gmp_coords}, kernel={gmp_kernel}")
+        _logger.info(f"GMP: use_gmp={use_gmp}, grid={gmp_grid}, coords={gmp_coords}, kernel={gmp_kernel}, max_delta_r={gmp_max_delta_r}")
 
         default_cfg = dict(embed_dim=embed_dim, num_heads=num_heads, ffn_ratio=4,
                            dropout=0.1, attn_dropout=0.1, activation_dropout=0.1,
@@ -915,6 +916,7 @@ class ParticleTransformerTagger(nn.Module):
                  gmp_kernel=3,
                  gmp_grid=0.05,
                  gmp_reduce="sum",
+                 gmp_max_delta_r=0.8,
                  use_phat=False,
                  phat_patch_size=10,
                  phat_use_patch_messages=True,
@@ -955,6 +957,7 @@ class ParticleTransformerTagger(nn.Module):
                                         gmp_kernel=gmp_kernel,
                                         gmp_grid=gmp_grid,
                                         gmp_reduce=gmp_reduce,
+                                        gmp_max_delta_r=gmp_max_delta_r,
                                         use_phat=use_phat,
                                         phat_patch_size=phat_patch_size,
                                         phat_use_patch_messages=phat_use_patch_messages,
