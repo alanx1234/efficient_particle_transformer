@@ -483,6 +483,14 @@ class PatchAttentionBlock(nn.Module):
 
     def forward(self, x, x_cls=None, padding_mask=None, attn_mask=None,
                 gmp=None, gmp_coords=None):
+        """
+        x:            (P_orig, N, C)
+        padding_mask: (N, P_orig)  True = padded
+        gmp:          GeometricMessagePassing module or None
+        gmp_coords:   (c1, c2) tuple of (N, P) tensors, pre-computed in ParticleTransformer.forward
+        attn_mask:    ignored (no interaction matrix in phat mode)
+        x_cls:        ignored (cls_blocks use vanilla Block, not PatchAttentionBlock)
+        """
         P_orig, N, C = x.shape
         P = self.patch_size
 
@@ -693,6 +701,8 @@ class ParticleTransformer(nn.Module):
                  phat_use_patch_messages=True,
                  phat_message_proj=True,
                  phat_gmp_per_block=False,
+                 # standard parT GMP per block (independent of phat)
+                 gmp_per_block=False,
                  **kwargs) -> None:
         super().__init__(**kwargs)
 
@@ -702,6 +712,7 @@ class ParticleTransformer(nn.Module):
         self.use_gmp = use_gmp
         self.gmp_coords = gmp_coords
         self.phat_gmp_per_block = phat_gmp_per_block
+        self.gmp_per_block = gmp_per_block
 
         self.trimmer = SequenceTrimmer(enabled=trim and not for_inference)
 
@@ -826,9 +837,10 @@ class ParticleTransformer(nn.Module):
                     )
 
             else:
-                # standard parT: GMP once upfront, then global attention + pair_embed
+                # standard parT: GMP then global attention + pair_embed
+                # pre-compute coords once if gmp is active
+                gmp_coords_std = None
                 if self.gmp is not None and v is not None:
-                    x_bpc = x.permute(1, 0, 2).contiguous()
                     eta, phi = compute_eta_phi_from_p4(v)
                     pad = padding_mask
                     phi_centered = unwrap_phi_per_jet(phi, pad=pad)
@@ -838,8 +850,13 @@ class ParticleTransformer(nn.Module):
                         c1, c2 = pt * eta, pt * phi_centered
                     else:
                         c1, c2 = eta, phi_centered
-                    x_bpc = self.gmp(x_bpc, c1, c2, pad=pad)
-                    x = x_bpc.permute(1, 0, 2).contiguous()
+                    gmp_coords_std = (c1, c2)
+
+                    if not self.gmp_per_block:
+                        # default: GMP once upfront
+                        x_bpc = x.permute(1, 0, 2).contiguous()
+                        x_bpc = self.gmp(x_bpc, c1, c2, pad=pad)
+                        x = x_bpc.permute(1, 0, 2).contiguous()
 
                 attn_mask = None
                 if (v is not None or uu is not None) and self.pair_embed is not None:
@@ -848,6 +865,12 @@ class ParticleTransformer(nn.Module):
                     attn_mask = self.pair_embed(v, uu).view(-1, v.size(-1), v.size(-1))
 
                 for block in self.blocks:
+                    if self.gmp_per_block and self.gmp is not None and gmp_coords_std is not None:
+                        # GMP at the start of every block before attention
+                        c1, c2 = gmp_coords_std
+                        x_bpc = x.permute(1, 0, 2).contiguous()
+                        x_bpc = self.gmp(x_bpc, c1, c2, pad=padding_mask)
+                        x = x_bpc.permute(1, 0, 2).contiguous()
                     x = block(x, x_cls=None, padding_mask=padding_mask, attn_mask=attn_mask)
 
             # class token (same for both paths)
@@ -897,6 +920,7 @@ class ParticleTransformerTagger(nn.Module):
                  phat_use_patch_messages=True,
                  phat_message_proj=True,
                  phat_gmp_per_block=False,
+                 gmp_per_block=False,
                  **kwargs) -> None:
         super().__init__(**kwargs)
 
@@ -935,7 +959,8 @@ class ParticleTransformerTagger(nn.Module):
                                         phat_patch_size=phat_patch_size,
                                         phat_use_patch_messages=phat_use_patch_messages,
                                         phat_message_proj=phat_message_proj,
-                                        phat_gmp_per_block=phat_gmp_per_block)
+                                        phat_gmp_per_block=phat_gmp_per_block,
+                                        gmp_per_block=gmp_per_block)
 
     @torch.jit.ignore
     def no_weight_decay(self):
