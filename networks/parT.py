@@ -414,7 +414,6 @@ class PatchAttentionBlock(nn.Module):
         self.patch_size = patch_size
         self.use_patch_messages = use_patch_messages
 
-        # ── local intra-patch attention ───────────────────────────────────
         self.norm1 = nn.LayerNorm(embed_dim)
         self.attn = nn.MultiheadAttention(
             embed_dim, num_heads, dropout=attn_dropout, add_bias_kv=add_bias_kv,
@@ -424,14 +423,11 @@ class PatchAttentionBlock(nn.Module):
 
         self.c_attn = nn.Parameter(torch.ones(num_heads), requires_grad=True) if scale_heads else None
         self.w_resid = nn.Parameter(torch.ones(embed_dim), requires_grad=True) if scale_resids else None
-
-        # ── hierarchical patch-level attention ────────────────────────────
+                     
         if use_patch_messages:
-            # no dropout on global stage, matching phatjet
             self.patch_attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=0.0)
             self.patch_proj = nn.Linear(embed_dim, embed_dim) if message_proj else None
 
-        # ── FFN ───────────────────────────────────────────────────────────
         self.norm2 = nn.LayerNorm(embed_dim)
         self.fc1 = nn.Linear(embed_dim, self.ffn_dim)
         self.act = nn.GELU() if activation == 'gelu' else nn.ReLU()
@@ -448,8 +444,6 @@ class PatchAttentionBlock(nn.Module):
         residual = x
         xn = self.norm1(x)
 
-        # guard against fully-padded patches: softmax(-inf) = NaN
-        # force position 0 unmasked for any all-padded patch
         if pm is not None:
             all_masked = pm.all(dim=1, keepdim=True)   # (NP*N, 1)
             pm = pm.clone()
@@ -470,10 +464,6 @@ class PatchAttentionBlock(nn.Module):
         return xn + residual
 
     def _patch_message(self, x_4d):
-        """
-        x_4d: (num_patches, patch_size, N, C)
-        returns msg: (num_patches, patch_size, N, C)
-        """
         NP, P, N, C = x_4d.shape
 
         # mean pool over patch -> (NP, N, C), treat N as batch dim for MHA
@@ -491,26 +481,15 @@ class PatchAttentionBlock(nn.Module):
 
     def forward(self, x, x_cls=None, padding_mask=None, attn_mask=None,
                 gmp=None, gmp_coords=None):
-        """
-        x:            (P_orig, N, C)
-        padding_mask: (N, P_orig)  True = padded
-        gmp:          GeometricMessagePassing module or None
-        gmp_coords:   (c1, c2) tuple of (N, P) tensors, pre-computed in ParticleTransformer.forward
-        attn_mask:    ignored (no interaction matrix in phat mode)
-        x_cls:        ignored (cls_blocks use vanilla Block, not PatchAttentionBlock)
-        """
         P_orig, N, C = x.shape
         P = self.patch_size
 
-        # ── 1. GMP at the start of every block (matching PTv3Block) ──────
         if gmp is not None and gmp_coords is not None:
             c1, c2 = gmp_coords
             x_bpc = x.permute(1, 0, 2).contiguous()   # (N, P_orig, C)
             x_bpc = gmp(x_bpc, c1, c2, pad=padding_mask)
             x = x_bpc.permute(1, 0, 2).contiguous()   # (P_orig, N, C)
-
-        # ── 2. pad to multiple of patch_size ─────────────────────────────
-        # use local variable so we never mutate the caller's padding_mask
+            
         local_pm = padding_mask
         remainder = P_orig % P
         if remainder != 0:
@@ -523,31 +502,23 @@ class PatchAttentionBlock(nn.Module):
         P_pad = x.shape[0]
         NP = P_pad // P
 
-        # ── 3. reshape: (P_pad, N, C) -> (NP, P, N, C) -> (P, NP*N, C) ─
         x_4d = x.reshape(NP, P, N, C)                         # (NP, P, N, C)
         x_flat = x_4d.permute(1, 0, 2, 3).reshape(P, NP * N, C)
 
-        # per-patch padding mask: (NP*N, P)
         if local_pm is not None:
             pm = local_pm.view(N, NP, P).permute(1, 0, 2).reshape(NP * N, P)
         else:
             pm = None
 
-        # ── 4. intra-patch attention ──────────────────────────────────────
         x_flat = self._intra_patch_attn(x_flat, pm)           # (P, NP*N, C)
-
-        # reshape back: (NP, P, N, C)
+                    
         x_4d = x_flat.reshape(P, NP, N, C).permute(1, 0, 2, 3).contiguous()
 
-        # ── 5. patch message broadcast ────────────────────────────────────
-        # matching PTv3Block: norm1 applied before patch_msg, dropout after
         if self.use_patch_messages:
             x_4d_normed = self.norm1(x_4d)
             msg = self._patch_message(x_4d_normed)             # (NP, P, N, C)
             x_4d = x_4d + self.dropout(msg)
 
-        # ── 6. FFN ────────────────────────────────────────────────────────
-        # x_4d is (NP, P, N, C); flatten NP*P -> P_pad keeping N,C order
         x = x_4d.contiguous().reshape(P_pad, N, C)
 
         residual = x
@@ -560,7 +531,6 @@ class PatchAttentionBlock(nn.Module):
         x = self.dropout(x)
         x = x + residual
 
-        # ── 7. strip padding ──────────────────────────────────────────────
         x = x[:P_orig]
 
         return x
