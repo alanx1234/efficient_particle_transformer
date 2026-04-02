@@ -404,7 +404,8 @@ class PatchAttentionBlock(nn.Module):
                  dropout=0.1, attn_dropout=0.1, activation_dropout=0.1,
                  add_bias_kv=False, activation='gelu',
                  scale_fc=True, scale_attn=True, scale_heads=True, scale_resids=True,
-                 patch_size=10, use_patch_messages=True, message_proj=True):
+                 patch_size=10, use_patch_messages=True, message_proj=True,
+                 use_interaction_matrix=False):
         super().__init__()
 
         self.embed_dim = embed_dim
@@ -413,6 +414,7 @@ class PatchAttentionBlock(nn.Module):
         self.ffn_dim = embed_dim * ffn_ratio
         self.patch_size = patch_size
         self.use_patch_messages = use_patch_messages
+        self.use_interaction_matrix = use_interaction_matrix
 
         self.norm1 = nn.LayerNorm(embed_dim)
         self.attn = nn.MultiheadAttention(
@@ -423,7 +425,7 @@ class PatchAttentionBlock(nn.Module):
 
         self.c_attn = nn.Parameter(torch.ones(num_heads), requires_grad=True) if scale_heads else None
         self.w_resid = nn.Parameter(torch.ones(embed_dim), requires_grad=True) if scale_resids else None
-                     
+
         if use_patch_messages:
             self.patch_attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=0.0)
             self.patch_proj = nn.Linear(embed_dim, embed_dim) if message_proj else None
@@ -435,10 +437,11 @@ class PatchAttentionBlock(nn.Module):
         self.post_fc_norm = nn.LayerNorm(self.ffn_dim) if scale_fc else None
         self.fc2 = nn.Linear(self.ffn_dim, embed_dim)
 
-    def _intra_patch_attn(self, x, pm):
+    def _intra_patch_attn(self, x, pm, attn_mask=None):
         """
         x:  (patch_size, num_patches*N, C)
         pm: (num_patches*N, patch_size) bool or None
+        attn_mask: (num_patches*N*num_heads, patch_size, patch_size) or None
         returns: (patch_size, num_patches*N, C)
         """
         residual = x
@@ -449,7 +452,7 @@ class PatchAttentionBlock(nn.Module):
             pm = pm.clone()
             pm[:, :1] = pm[:, :1] & ~all_masked        # unmask pos 0 for fully-padded patches
 
-        xn, _ = self.attn(xn, xn, xn, key_padding_mask=pm)
+        xn, _ = self.attn(xn, xn, xn, key_padding_mask=pm, attn_mask=attn_mask)
 
         if self.c_attn is not None:
             P = xn.size(0)
@@ -466,21 +469,17 @@ class PatchAttentionBlock(nn.Module):
     def _patch_message(self, x_4d):
         NP, P, N, C = x_4d.shape
 
-        # mean pool over patch -> (NP, N, C), treat N as batch dim for MHA
         patch_tokens = x_4d.mean(dim=1)           # (NP, N, C)
-
-        # MHA expects (seq, batch, embed): seq=NP, batch=N
         pt_out, _ = self.patch_attn(patch_tokens, patch_tokens, patch_tokens)  # (NP, N, C)
 
         if self.patch_proj is not None:
             pt_out = self.patch_proj(pt_out)       # (NP, N, C)
 
-        # broadcast to all particles in each patch: (NP, 1, N, C) -> (NP, P, N, C)
         msg = pt_out.unsqueeze(1).expand(NP, P, N, C)
         return msg
 
     def forward(self, x, x_cls=None, padding_mask=None, attn_mask=None,
-                gmp=None, gmp_coords=None):
+                gmp=None, gmp_coords=None, v=None, pair_embed=None):
         P_orig, N, C = x.shape
         P = self.patch_size
 
@@ -489,7 +488,7 @@ class PatchAttentionBlock(nn.Module):
             x_bpc = x.permute(1, 0, 2).contiguous()   # (N, P_orig, C)
             x_bpc = gmp(x_bpc, c1, c2, pad=padding_mask)
             x = x_bpc.permute(1, 0, 2).contiguous()   # (P_orig, N, C)
-            
+
         local_pm = padding_mask
         remainder = P_orig % P
         if remainder != 0:
@@ -510,8 +509,42 @@ class PatchAttentionBlock(nn.Module):
         else:
             pm = None
 
-        x_flat = self._intra_patch_attn(x_flat, pm)           # (P, NP*N, C)
-                    
+        # --- interaction matrix (within-patch pairwise bias) ---
+        # following parT's design: compute physics-motivated pairwise features
+        # (lnkt, lnz, lndelta, lnm2) for particle pairs within each patch,
+        # pass through shared PairEmbed MLP, add as bias to attention logits.
+        # this gives the model direct access to Lund plane / kT splitting
+        # variables within each kT-clustered patch neighborhood.
+        patch_attn_mask = None
+        if self.use_interaction_matrix and pair_embed is not None and v is not None:
+            # zero out padded particles before computing pairwise features,
+            # consistent with how standard parT handles this before pair_embed.
+            # use v_in as a local so we don't mutate v across blocks.
+            # padding_mask is (N, P_orig), v is (N, 4, P_orig) — shapes align.
+            v_in = v.masked_fill(padding_mask.unsqueeze(1), 0.0)  # (N, 4, P_orig)
+
+            # pad v_in to P_pad along particle dim to match x
+            if remainder != 0:
+                pad_len = P - remainder
+                v_padded = torch.cat(
+                    [v_in, v_in.new_zeros(N, 4, pad_len)], dim=2
+                )  # (N, 4, P_pad)
+            else:
+                v_padded = v_in  # (N, 4, P_pad)
+
+            # reshape into patches: (N, 4, P_pad) -> (N, 4, NP, P) -> (NP*N, 4, P)
+            v_flat = v_padded.view(N, 4, NP, P).permute(2, 0, 1, 3).reshape(NP * N, 4, P)
+
+            # PairEmbed outputs (NP*N, num_heads, P, P)
+            # use_pre_activation_pair=True in the shared embed so output is
+            # raw (no final activation) before being added to logits
+            pair_bias = pair_embed(v_flat)  # (NP*N, num_heads, P, P)
+
+            # nn.MultiheadAttention expects attn_mask: (NP*N*num_heads, P, P)
+            patch_attn_mask = pair_bias.view(NP * N * self.num_heads, P, P)
+
+        x_flat = self._intra_patch_attn(x_flat, pm, attn_mask=patch_attn_mask)
+
         x_4d = x_flat.reshape(P, NP, N, C).permute(1, 0, 2, 3).contiguous()
 
         if self.use_patch_messages:
@@ -584,8 +617,6 @@ class GeometricMessagePassing(nn.Module):
             c1_shift = c1 - c1.min(dim=1, keepdim=True).values
             c2_shift = c2 - c2.min(dim=1, keepdim=True).values
 
-        # cap grid dims to max_delta_r/grid_size — fixes H,W at a constant size
-        # so conv2d always operates on the same shape, removing dynamic resizing overhead
         max_cells = max(1, int(self.max_delta_r / self.grid_size))
         H, W = max_cells, max_cells
 
@@ -651,28 +682,15 @@ def sort_by_pt(x: torch.Tensor, v: torch.Tensor, padding_mask: torch.Tensor):
     padding_mask: (N, P) True = padded
     Returns sorted x, v, padding_mask.
     """
-    # compute pt from v: (N, P)
     px, py = v[:, 0, :], v[:, 1, :]
     pt = torch.sqrt(px * px + py * py)
-
-    # set padded particle pt to -1 so they sort to the end
     pt = pt.masked_fill(padding_mask, -1.0)
-
-    # argsort descending: (N, P)
     sort_idx = pt.argsort(dim=1, descending=True)  # (N, P)
-
-    # reorder v: (N, 4, P)
     v = torch.gather(v, 2, sort_idx.unsqueeze(1).expand_as(v))
-
-    # reorder x: (P, N, C) -> gather along dim 0 using (N, P) -> need (P, N, C)
-    # transpose to (N, P, C), gather, transpose back
     x = x.permute(1, 0, 2)                                         # (N, P, C)
     x = torch.gather(x, 1, sort_idx.unsqueeze(-1).expand_as(x))    # (N, P, C)
     x = x.permute(1, 0, 2)                                         # (P, N, C)
-
-    # reorder padding_mask: (N, P)
     padding_mask = torch.gather(padding_mask, 1, sort_idx)
-
     return x, v, padding_mask
 
 
@@ -712,7 +730,8 @@ class ParticleTransformer(nn.Module):
                  phat_use_patch_messages=True,
                  phat_message_proj=True,
                  phat_gmp_per_block=False,
-                 phat_sort=True,       # sort by pt before patching (default on)
+                 phat_sort=True,
+                 phat_use_interaction_matrix=False,   # <-- new flag
                  # standard parT GMP per block (independent of phat)
                  gmp_per_block=False,
                  **kwargs) -> None:
@@ -731,7 +750,7 @@ class ParticleTransformer(nn.Module):
 
         embed_dim = embed_dims[-1] if len(embed_dims) > 0 else input_dim
 
-        # GMP: single module, shared (called once per block inside PatchAttentionBlock.forward)
+        # GMP: single module, shared
         self.gmp = None
         if use_gmp:
             self.gmp = GeometricMessagePassing(
@@ -761,12 +780,25 @@ class ParticleTransformer(nn.Module):
         self.pair_extra_dim = pair_extra_dim
         self.embed = Embed(input_dim, embed_dims, activation=activation) if len(embed_dims) > 0 else nn.Identity()
 
-        # pair_embed only constructed (and used) in standard parT mode
+        # pair_embed for standard parT mode (global attention)
         self.pair_embed = PairEmbed(
             pair_input_dim, pair_extra_dim, pair_embed_dims + [cfg_block['num_heads']],
             remove_self_pair=remove_self_pair, use_pre_activation_pair=use_pre_activation_pair,
             for_onnx=for_inference,
         ) if (not use_phat) and pair_embed_dims is not None and pair_input_dim + pair_extra_dim > 0 else None
+
+        # shared PairEmbed for phat interaction matrix.
+        # use_pre_activation_pair=True so the MLP output is raw (no final
+        # activation) before being added directly to attention logits,
+        # consistent with how parT uses the interaction matrix.
+        self.phat_pair_embed = PairEmbed(
+            pair_input_dim, 0, pair_embed_dims + [cfg_block['num_heads']],
+            remove_self_pair=remove_self_pair, use_pre_activation_pair=True,
+            for_onnx=for_inference,
+        ) if use_phat and phat_use_interaction_matrix and pair_embed_dims is not None and pair_input_dim > 0 else None
+
+        _logger.info(f"PHAT interaction matrix: phat_use_interaction_matrix={phat_use_interaction_matrix}, "
+                     f"phat_pair_embed={'enabled' if self.phat_pair_embed is not None else 'disabled'}")
 
         if use_phat:
             self.blocks = nn.ModuleList([
@@ -775,12 +807,12 @@ class ParticleTransformer(nn.Module):
                     patch_size=phat_patch_size,
                     use_patch_messages=phat_use_patch_messages,
                     message_proj=phat_message_proj,
+                    use_interaction_matrix=phat_use_interaction_matrix,
                 ) for _ in range(num_layers)
             ])
         else:
             self.blocks = nn.ModuleList([Block(**cfg_block) for _ in range(num_layers)])
 
-        # cls_blocks always use vanilla Block (class-token attention unchanged)
         self.cls_blocks = nn.ModuleList([Block(**cfg_cls_block) for _ in range(num_cls_layers)])
         self.norm = nn.LayerNorm(embed_dim)
 
@@ -819,12 +851,9 @@ class ParticleTransformer(nn.Module):
             x = self.embed(x).masked_fill(~mask.permute(2, 0, 1), 0)
 
             if self.use_phat:
-                # sort by pt descending before patching so high-pt subjet
-                # cores land in the same patch (toggled via phat_sort)
                 if self.phat_sort and v is not None:
                     x, v, padding_mask = sort_by_pt(x, v, padding_mask)
 
-                # compute gmp coords (needed for both upfront and per-block modes)
                 gmp_coords = None
                 if self.gmp is not None and v is not None:
                     eta, phi = compute_eta_phi_from_p4(v)
@@ -839,13 +868,12 @@ class ParticleTransformer(nn.Module):
                     gmp_coords = (c1, c2)
 
                 if self.gmp is not None and not self.phat_gmp_per_block:
-                    # GMP once upfront before block loop (default)
                     x_bpc = x.permute(1, 0, 2).contiguous()
                     x_bpc = self.gmp(x_bpc, gmp_coords[0], gmp_coords[1], pad=padding_mask)
                     x = x_bpc.permute(1, 0, 2).contiguous()
-                    gmp_pass = None   # blocks receive no gmp; coords already baked in
+                    gmp_pass = None
                 else:
-                    gmp_pass = self.gmp  # blocks will call GMP themselves each time
+                    gmp_pass = self.gmp
 
                 for block in self.blocks:
                     x = block(
@@ -853,11 +881,12 @@ class ParticleTransformer(nn.Module):
                         padding_mask=padding_mask,
                         gmp=gmp_pass,
                         gmp_coords=gmp_coords,
+                        v=v,                               # 4-vectors for interaction matrix
+                        pair_embed=self.phat_pair_embed,   # shared PairEmbed (None if disabled)
                     )
 
             else:
-                # standard parT: GMP then global attention + pair_embed
-                # pre-compute coords once if gmp is active
+                # standard parT path — unchanged
                 gmp_coords_std = None
                 if self.gmp is not None and v is not None:
                     eta, phi = compute_eta_phi_from_p4(v)
@@ -872,7 +901,6 @@ class ParticleTransformer(nn.Module):
                     gmp_coords_std = (c1, c2)
 
                     if not self.gmp_per_block:
-                        # default: GMP once upfront
                         x_bpc = x.permute(1, 0, 2).contiguous()
                         x_bpc = self.gmp(x_bpc, c1, c2, pad=pad)
                         x = x_bpc.permute(1, 0, 2).contiguous()
@@ -885,7 +913,6 @@ class ParticleTransformer(nn.Module):
 
                 for block in self.blocks:
                     if self.gmp_per_block and self.gmp is not None and gmp_coords_std is not None:
-                        # GMP at the start of every block before attention
                         c1, c2 = gmp_coords_std
                         x_bpc = x.permute(1, 0, 2).contiguous()
                         x_bpc = self.gmp(x_bpc, c1, c2, pad=padding_mask)
@@ -941,6 +968,7 @@ class ParticleTransformerTagger(nn.Module):
                  phat_message_proj=True,
                  phat_gmp_per_block=False,
                  phat_sort=True,
+                 phat_use_interaction_matrix=False,
                  gmp_per_block=False,
                  **kwargs) -> None:
         super().__init__(**kwargs)
@@ -983,6 +1011,7 @@ class ParticleTransformerTagger(nn.Module):
                                         phat_message_proj=phat_message_proj,
                                         phat_gmp_per_block=phat_gmp_per_block,
                                         phat_sort=phat_sort,
+                                        phat_use_interaction_matrix=phat_use_interaction_matrix,
                                         gmp_per_block=gmp_per_block)
 
     @torch.jit.ignore
