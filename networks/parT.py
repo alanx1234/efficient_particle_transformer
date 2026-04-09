@@ -486,60 +486,77 @@ class GeometricMessagePassing(nn.Module):
         self.pointwise = nn.Linear(channels, channels, bias=True)
         self.norm = nn.LayerNorm(channels, eps=1e-6)
 
-    def forward(self, x: torch.Tensor,  c1: torch.Tensor, c2: torch.Tensor, pad: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        c1: torch.Tensor,
+        c2: torch.Tensor,
+        pad: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         B, P, C = x.shape
         assert C == self.channels
         residual = x
-
+    
         if pad is not None:
             c1_for_min = c1.masked_fill(pad, float("inf"))
             c2_for_min = c2.masked_fill(pad, float("inf"))
             c1_min = c1_for_min.min(dim=1, keepdim=True).values
             c2_min = c2_for_min.min(dim=1, keepdim=True).values
-
             c1_min = torch.where(torch.isfinite(c1_min), c1_min, torch.zeros_like(c1_min))
             c2_min = torch.where(torch.isfinite(c2_min), c2_min, torch.zeros_like(c2_min))
-
             c1_shift = (c1 - c1_min).masked_fill(pad, 0.0)
             c2_shift = (c2 - c2_min).masked_fill(pad, 0.0)
         else:
             c1_shift = c1 - c1.min(dim=1, keepdim=True).values
             c2_shift = c2 - c2.min(dim=1, keepdim=True).values
-
-        grid_eta = (c1_shift / self.grid_size).floor().to(torch.long) # [B,P]
-        grid_phi = (c2_shift / self.grid_size).floor().to(torch.long) # [B,P]
-
+    
+        grid_eta = (c1_shift / self.grid_size).floor().to(torch.long)
+        grid_phi = (c2_shift / self.grid_size).floor().to(torch.long)
+    
+        # dynamic grid sizing (no static cap)
         H = int(grid_eta.max().item()) + 1
         W = int(grid_phi.max().item()) + 1
-
         H = max(H, 1)
         W = max(W, 1)
-
-        grid_eta = grid_eta.clamp(0, H - 1)
-        grid_phi = grid_phi.clamp(0, W - 1)
-
-        HW = H * W
-        b_idx = torch.arange(B, device=x.device).view(B, 1).expand(B, P)  # [B,P]
-        flat_idx = (b_idx * HW + grid_eta * W + grid_phi).reshape(-1)      # [B*P]
-
-        # Scatter into grid_flat: [B*H*W, C]
-        grid_flat = x.new_zeros((B * HW, C))
+    
+        # --- issue #3 fix: redirect padded particles to scratch cells ---
+        # padded particles land at a (H, W) scratch cell that is outside
+        # the real [0..H-1, 0..W-1] grid, so they never contaminate real cells
+        if pad is not None:
+            grid_eta_scatter = torch.where(pad, torch.full_like(grid_eta, H), grid_eta)
+            grid_phi_scatter = torch.where(pad, torch.full_like(grid_phi, W), grid_phi)
+        else:
+            grid_eta_scatter = grid_eta.clamp(0, H - 1)
+            grid_phi_scatter = grid_phi.clamp(0, W - 1)
+    
+        # grid_flat has one extra row and col to absorb the scratch cell
+        H_alloc, W_alloc = H + 1, W + 1
+        HW_alloc = H_alloc * W_alloc
+    
+        b_idx = torch.arange(B, device=x.device).view(B, 1).expand(B, P)
+        flat_idx = (b_idx * HW_alloc + grid_eta_scatter * W_alloc + grid_phi_scatter).reshape(-1)
+    
+        grid_flat = x.new_zeros((B * HW_alloc, C))
         grid_flat.scatter_add_(0, flat_idx[:, None].expand(-1, C), x.reshape(-1, C))
-
+    
+        # --- issue #4 fix: exclude padded particles from mean count ---
         if self.scatter_reduce == "mean":
-            ones = x.new_ones((B * P,))
-            counts = x.new_zeros((B * HW,))
-            counts.scatter_add_(0, flat_idx, ones)
+            real = (~pad).to(x.dtype).reshape(-1) if pad is not None else x.new_ones(B * P)
+            counts = x.new_zeros((B * HW_alloc,))
+            counts.scatter_add_(0, flat_idx, real)
             grid_flat = grid_flat / (counts[:, None] + self.eps)
-
-        # Conv: [B,C,H,W]
-        grid = grid_flat.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
+    
+        # slice off the scratch row/col before conv — conv only sees real cells
+        grid = grid_flat.view(B, H_alloc, W_alloc, C)[:, :H, :W, :]
+        grid = grid.permute(0, 3, 1, 2).contiguous()
         grid = self.conv2d(grid)
-
-        # Gather back: [B,P,C]
+    
+        # gather back using the original (unclamped) real indices
         grid_bhwc = grid.permute(0, 2, 3, 1).contiguous()
-        out = grid_bhwc[b_idx, grid_eta, grid_phi]
-
+        grid_eta_real = grid_eta.clamp(0, H - 1)
+        grid_phi_real = grid_phi.clamp(0, W - 1)
+        out = grid_bhwc[b_idx, grid_eta_real, grid_phi_real]
+    
         out = self.pointwise(out)
         out = self.norm(out)
         return residual + out
