@@ -501,42 +501,44 @@ class GeometricMessagePassing(nn.Module):
         self.pointwise = nn.Linear(channels, channels, bias=True)
         self.norm = nn.LayerNorm(channels, eps=1e-6)
 
-    def _single_scale_forward(
-        self,
-        x: torch.Tensor,           # [B, P, C]
-        c1_shift: torch.Tensor,    # [B, P]
-        c2_shift: torch.Tensor,    # [B, P]
-        pad: torch.Tensor,         # [B, P] bool, True = padded
-        grid_size: float,
-        conv2d: nn.Conv2d,
-    ) -> torch.Tensor:              # [B, P, C]
+    def _single_scale_forward(self, x, c1_shift, c2_shift, pad, grid_size, conv2d):
         B, P, C = x.shape
-
-        max_cells = max(1, int(self.max_delta_r / grid_size))
-
-        grid_eta = (c1_shift / grid_size).floor().to(torch.long).clamp(0, max_cells - 1)
-        grid_phi = (c2_shift / grid_size).floor().to(torch.long).clamp(0, max_cells - 1)
-
-        H, W = max_cells, max_cells
-        HW = H * W
-
+    
+        grid_eta = (c1_shift / grid_size).floor().to(torch.long)
+        grid_phi = (c2_shift / grid_size).floor().to(torch.long)
+    
+        # dynamic sizing
+        H = max(int(grid_eta.max().item()) + 1, 1)
+        W = max(int(grid_phi.max().item()) + 1, 1)
+    
+        # scratch cell for padded particles
+        if pad is not None:
+            grid_eta_scatter = torch.where(pad, torch.full_like(grid_eta, H), grid_eta)
+            grid_phi_scatter = torch.where(pad, torch.full_like(grid_phi, W), grid_phi)
+        else:
+            grid_eta_scatter = grid_eta.clamp(0, H - 1)
+            grid_phi_scatter = grid_phi.clamp(0, W - 1)
+    
+        H_alloc, W_alloc = H + 1, W + 1
         b_idx = torch.arange(B, device=x.device).view(B, 1).expand(B, P)
-        flat_idx = (b_idx * HW + grid_eta * W + grid_phi).reshape(-1)
-
-        grid_flat = x.new_zeros((B * HW, C))
+        flat_idx = (b_idx * H_alloc * W_alloc + grid_eta_scatter * W_alloc + grid_phi_scatter).reshape(-1)
+    
+        grid_flat = x.new_zeros((B * H_alloc * W_alloc, C))
         grid_flat.scatter_add_(0, flat_idx[:, None].expand(-1, C), x.reshape(-1, C))
-
+    
         if self.scatter_reduce == "mean":
-            ones = x.new_ones((B * P,))
-            counts = x.new_zeros((B * HW,))
-            counts.scatter_add_(0, flat_idx, ones)
+            real = (~pad).to(x.dtype).reshape(-1) if pad is not None else x.new_ones(B * P)
+            counts = x.new_zeros((B * H_alloc * W_alloc,))
+            counts.scatter_add_(0, flat_idx, real)
             grid_flat = grid_flat / (counts[:, None] + self.eps)
-
-        grid = grid_flat.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
+    
+        # slice off scratch row/col before conv
+        grid = grid_flat.view(B, H_alloc, W_alloc, C)[:, :H, :W, :]
+        grid = grid.permute(0, 3, 1, 2).contiguous()
         grid = conv2d(grid)
-
+    
         grid_bhwc = grid.permute(0, 2, 3, 1).contiguous()
-        out = grid_bhwc[b_idx, grid_eta, grid_phi]  # [B, P, C]
+        out = grid_bhwc[b_idx, grid_eta.clamp(0, H - 1), grid_phi.clamp(0, W - 1)]
         return out
 
     def forward(
