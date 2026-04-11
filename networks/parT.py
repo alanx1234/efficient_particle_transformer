@@ -399,6 +399,7 @@ class Block(nn.Module):
         return x
 
 
+
 class PatchAttentionBlock(nn.Module):
     def __init__(self, embed_dim=128, num_heads=8, ffn_ratio=4,
                  dropout=0.1, attn_dropout=0.1, activation_dropout=0.1,
@@ -437,20 +438,34 @@ class PatchAttentionBlock(nn.Module):
         self.post_fc_norm = nn.LayerNorm(self.ffn_dim) if scale_fc else None
         self.fc2 = nn.Linear(self.ffn_dim, embed_dim)
 
+    def _extract_local_attn_mask(self, attn_mask, N, NP, P, P_pad):
+        if attn_mask is None:
+            return None
+
+        NH = attn_mask.size(0)
+        H = self.num_heads
+        assert NH == N * H
+
+        if attn_mask.size(-1) != P_pad:
+            src_len = attn_mask.size(-1)
+            padded = attn_mask.new_zeros(NH, P_pad, P_pad)
+            padded[:, :src_len, :src_len] = attn_mask
+            attn_mask = padded
+
+        attn_mask = attn_mask.view(N, H, P_pad, P_pad)
+        blocks = [attn_mask[:, :, i * P:(i + 1) * P, i * P:(i + 1) * P] for i in range(NP)]
+        attn_mask = torch.stack(blocks, dim=0)
+        attn_mask = attn_mask.reshape(NP * N * H, P, P)
+        return attn_mask
+
     def _intra_patch_attn(self, x, pm, attn_mask=None):
-        """
-        x:  (patch_size, num_patches*N, C)
-        pm: (num_patches*N, patch_size) bool or None
-        attn_mask: (num_patches*N*num_heads, patch_size, patch_size) or None
-        returns: (patch_size, num_patches*N, C)
-        """
         residual = x
         xn = self.norm1(x)
 
         if pm is not None:
-            all_masked = pm.all(dim=1, keepdim=True)   # (NP*N, 1)
+            all_masked = pm.all(dim=1, keepdim=True)
             pm = pm.clone()
-            pm[:, :1] = pm[:, :1] & ~all_masked        # unmask pos 0 for fully-padded patches
+            pm[:, :1] = pm[:, :1] & ~all_masked
 
         xn, _ = self.attn(xn, xn, xn, key_padding_mask=pm, attn_mask=attn_mask)
 
@@ -466,16 +481,33 @@ class PatchAttentionBlock(nn.Module):
             residual = torch.mul(self.w_resid, residual)
         return xn + residual
 
-    def _patch_message(self, x_4d):
+    def _patch_message(self, x_4d, patch_pad_mask):
         NP, P, N, C = x_4d.shape
 
-        patch_tokens = x_4d.mean(dim=1)           # (NP, N, C)
-        pt_out, _ = self.patch_attn(patch_tokens, patch_tokens, patch_tokens)  # (NP, N, C)
+        real_mask = ~patch_pad_mask
+        denom = real_mask.sum(dim=1).clamp(min=1).to(x_4d.dtype).unsqueeze(-1)
+        patch_tokens = (x_4d * real_mask.unsqueeze(-1).to(x_4d.dtype)).sum(dim=1) / denom
+
+        patch_kpm = ~real_mask.any(dim=1).transpose(0, 1).contiguous()
+        all_masked = patch_kpm.all(dim=1, keepdim=True)
+        patch_kpm = patch_kpm.clone()
+        patch_kpm[:, :1] = patch_kpm[:, :1] & ~all_masked
+
+        pt_out, _ = self.patch_attn(
+            patch_tokens,
+            patch_tokens,
+            patch_tokens,
+            key_padding_mask=patch_kpm,
+        )
+
+        patch_valid = real_mask.any(dim=1)
+        pt_out = pt_out.masked_fill(~patch_valid.unsqueeze(-1), 0.0)
 
         if self.patch_proj is not None:
-            pt_out = self.patch_proj(pt_out)       # (NP, N, C)
+            pt_out = self.patch_proj(pt_out)
 
         msg = pt_out.unsqueeze(1).expand(NP, P, N, C)
+        msg = msg.masked_fill(patch_pad_mask.unsqueeze(-1), 0.0)
         return msg
 
     def forward(self, x, x_cls=None, padding_mask=None, attn_mask=None,
@@ -485,9 +517,11 @@ class PatchAttentionBlock(nn.Module):
 
         if gmp is not None and gmp_coords is not None:
             c1, c2 = gmp_coords
-            x_bpc = x.permute(1, 0, 2).contiguous()   # (N, P_orig, C)
+            x_bpc = x.permute(1, 0, 2).contiguous()
             x_bpc = gmp(x_bpc, c1, c2, pad=padding_mask)
-            x = x_bpc.permute(1, 0, 2).contiguous()   # (P_orig, N, C)
+            if padding_mask is not None:
+                x_bpc = x_bpc.masked_fill(padding_mask.unsqueeze(-1), 0.0)
+            x = x_bpc.permute(1, 0, 2).contiguous()
 
         local_pm = padding_mask
         remainder = P_orig % P
@@ -495,62 +529,52 @@ class PatchAttentionBlock(nn.Module):
             pad_len = P - remainder
             x = torch.cat([x, x.new_zeros(pad_len, N, C)], dim=0)
             if local_pm is not None:
-                local_pm = torch.cat(
-                    [local_pm, local_pm.new_ones(N, pad_len)], dim=1
-                )
+                local_pm = torch.cat([local_pm, local_pm.new_ones(N, pad_len)], dim=1)
         P_pad = x.shape[0]
         NP = P_pad // P
 
-        x_4d = x.reshape(NP, P, N, C)                         # (NP, P, N, C)
+        x_4d = x.reshape(NP, P, N, C)
         x_flat = x_4d.permute(1, 0, 2, 3).reshape(P, NP * N, C)
 
         if local_pm is not None:
-            pm = local_pm.view(N, NP, P).permute(1, 0, 2).reshape(NP * N, P)
+            patch_pad_mask = local_pm.view(N, NP, P).permute(1, 2, 0).contiguous()
+            pm = patch_pad_mask.permute(0, 2, 1).reshape(NP * N, P)
         else:
+            patch_pad_mask = None
             pm = None
 
-        # --- interaction matrix (within-patch pairwise bias) ---
-        # following parT's design: compute physics-motivated pairwise features
-        # (lnkt, lnz, lndelta, lnm2) for particle pairs within each patch,
-        # pass through shared PairEmbed MLP, add as bias to attention logits.
-        # this gives the model direct access to Lund plane / kT splitting
-        # variables within each kT-clustered patch neighborhood.
         patch_attn_mask = None
         if self.use_interaction_matrix and pair_embed is not None and v is not None:
-            # zero out padded particles before computing pairwise features,
-            # consistent with how standard parT handles this before pair_embed.
-            # use v_in as a local so we don't mutate v across blocks.
-            # padding_mask is (N, P_orig), v is (N, 4, P_orig) — shapes align.
-            v_in = v.masked_fill(padding_mask.unsqueeze(1), 0.0)  # (N, 4, P_orig)
-
-            # pad v_in to P_pad along particle dim to match x
+            if padding_mask is not None:
+                v_in = v.masked_fill(padding_mask.unsqueeze(1), 0.0)
+            else:
+                v_in = v
             if remainder != 0:
                 pad_len = P - remainder
-                v_padded = torch.cat(
-                    [v_in, v_in.new_zeros(N, 4, pad_len)], dim=2
-                )  # (N, 4, P_pad)
+                v_padded = torch.cat([v_in, v_in.new_zeros(N, 4, pad_len)], dim=2)
             else:
-                v_padded = v_in  # (N, 4, P_pad)
-
-            # reshape into patches: (N, 4, P_pad) -> (N, 4, NP, P) -> (NP*N, 4, P)
+                v_padded = v_in
             v_flat = v_padded.view(N, 4, NP, P).permute(2, 0, 1, 3).reshape(NP * N, 4, P)
-
-            # PairEmbed outputs (NP*N, num_heads, P, P)
-            # use_pre_activation_pair=True in the shared embed so output is
-            # raw (no final activation) before being added to logits
-            pair_bias = pair_embed(v_flat)  # (NP*N, num_heads, P, P)
-
-            # nn.MultiheadAttention expects attn_mask: (NP*N*num_heads, P, P)
+            pair_bias = pair_embed(v_flat)
             patch_attn_mask = pair_bias.view(NP * N * self.num_heads, P, P)
+
+        if patch_attn_mask is None:
+            patch_attn_mask = self._extract_local_attn_mask(attn_mask, N, NP, P, P_pad)
 
         x_flat = self._intra_patch_attn(x_flat, pm, attn_mask=patch_attn_mask)
 
         x_4d = x_flat.reshape(P, NP, N, C).permute(1, 0, 2, 3).contiguous()
 
+        if patch_pad_mask is not None:
+            x_4d = x_4d.masked_fill(patch_pad_mask.unsqueeze(-1), 0.0)
+
         if self.use_patch_messages:
             x_4d_normed = self.norm1(x_4d)
-            msg = self._patch_message(x_4d_normed)             # (NP, P, N, C)
+            if patch_pad_mask is None:
+                patch_pad_mask = x_4d.new_zeros((NP, P, N), dtype=torch.bool)
+            msg = self._patch_message(x_4d_normed, patch_pad_mask)
             x_4d = x_4d + self.dropout(msg)
+            x_4d = x_4d.masked_fill(patch_pad_mask.unsqueeze(-1), 0.0)
 
         x = x_4d.contiguous().reshape(P_pad, N, C)
 
@@ -565,6 +589,8 @@ class PatchAttentionBlock(nn.Module):
         x = x + residual
 
         x = x[:P_orig]
+        if padding_mask is not None:
+            x = x.masked_fill(padding_mask.transpose(0, 1).unsqueeze(-1), 0.0)
 
         return x
 
@@ -882,19 +908,29 @@ class ParticleTransformer(nn.Module):
                 if self.gmp is not None and not self.phat_gmp_per_block:
                     x_bpc = x.permute(1, 0, 2).contiguous()
                     x_bpc = self.gmp(x_bpc, gmp_coords[0], gmp_coords[1], pad=padding_mask)
+                    x_bpc = x_bpc.masked_fill(padding_mask.unsqueeze(-1), 0.0)
                     x = x_bpc.permute(1, 0, 2).contiguous()
                     gmp_pass = None
                 else:
                     gmp_pass = self.gmp
 
+                attn_mask = None
+                if (v is not None or uu is not None) and self.pair_embed is not None:
+                    if v is not None:
+                        v_masked = v.masked_fill(~mask.expand_as(v), 0.0)
+                    else:
+                        v_masked = v
+                    attn_mask = self.pair_embed(v_masked, uu).view(-1, v.size(-1), v.size(-1))
+
                 for block in self.blocks:
                     x = block(
                         x,
                         padding_mask=padding_mask,
+                        attn_mask=attn_mask,
                         gmp=gmp_pass,
                         gmp_coords=gmp_coords,
-                        v=v,                               # 4-vectors for interaction matrix
-                        pair_embed=self.phat_pair_embed,   # shared PairEmbed (None if disabled)
+                        v=v,
+                        pair_embed=self.phat_pair_embed,
                     )
 
             else:
@@ -915,6 +951,7 @@ class ParticleTransformer(nn.Module):
                     if not self.gmp_per_block:
                         x_bpc = x.permute(1, 0, 2).contiguous()
                         x_bpc = self.gmp(x_bpc, c1, c2, pad=pad)
+                        x_bpc = x_bpc.masked_fill(padding_mask.unsqueeze(-1), 0.0)
                         x = x_bpc.permute(1, 0, 2).contiguous()
 
                 attn_mask = None
@@ -928,6 +965,7 @@ class ParticleTransformer(nn.Module):
                         c1, c2 = gmp_coords_std
                         x_bpc = x.permute(1, 0, 2).contiguous()
                         x_bpc = self.gmp(x_bpc, c1, c2, pad=padding_mask)
+                        x_bpc = x_bpc.masked_fill(padding_mask.unsqueeze(-1), 0.0)
                         x = x_bpc.permute(1, 0, 2).contiguous()
                     x = block(x, x_cls=None, padding_mask=padding_mask, attn_mask=attn_mask)
 
