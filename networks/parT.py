@@ -543,23 +543,10 @@ class PatchAttentionBlock(nn.Module):
             patch_pad_mask = None
             pm = None
 
-        patch_attn_mask = None
-        if self.use_interaction_matrix and pair_embed is not None and v is not None:
-            if padding_mask is not None:
-                v_in = v.masked_fill(padding_mask.unsqueeze(1), 0.0)
-            else:
-                v_in = v
-            if remainder != 0:
-                pad_len = P - remainder
-                v_padded = torch.cat([v_in, v_in.new_zeros(N, 4, pad_len)], dim=2)
-            else:
-                v_padded = v_in
-            v_flat = v_padded.view(N, 4, NP, P).permute(2, 0, 1, 3).reshape(NP * N, 4, P)
-            pair_bias = pair_embed(v_flat)
-            patch_attn_mask = pair_bias.view(NP * N * self.num_heads, P, P)
-
-        if patch_attn_mask is None:
-            patch_attn_mask = self._extract_local_attn_mask(attn_mask, N, NP, P, P_pad)
+        # CHANGE 3: always slice the full N×N attn_mask (computed from full
+        # kinematics upfront in forward()). phat_pair_embed is removed entirely.
+        # v and pair_embed args are unused now but kept in signature for compat.
+        patch_attn_mask = self._extract_local_attn_mask(attn_mask, N, NP, P, P_pad)
 
         x_flat = self._intra_patch_attn(x_flat, pm, attn_mask=patch_attn_mask)
 
@@ -629,7 +616,7 @@ class GeometricMessagePassing(nn.Module):
         B, P, C = x.shape
         assert C == self.channels
         residual = x
-    
+
         if pad is not None:
             c1_for_min = c1.masked_fill(pad, float("inf"))
             c2_for_min = c2.masked_fill(pad, float("inf"))
@@ -642,14 +629,14 @@ class GeometricMessagePassing(nn.Module):
         else:
             c1_shift = c1 - c1.min(dim=1, keepdim=True).values
             c2_shift = c2 - c2.min(dim=1, keepdim=True).values
-    
+
         grid_eta = (c1_shift / self.grid_size).floor().to(torch.long)
         grid_phi = (c2_shift / self.grid_size).floor().to(torch.long)
-    
+
         # dynamic grid sizing
         H = max(int(grid_eta.max().item()) + 1, 1)
         W = max(int(grid_phi.max().item()) + 1, 1)
-    
+
         # redirect padded particles to scratch cell (H, W) outside the real grid
         if pad is not None:
             grid_eta_scatter = torch.where(pad, torch.full_like(grid_eta, H), grid_eta)
@@ -657,29 +644,29 @@ class GeometricMessagePassing(nn.Module):
         else:
             grid_eta_scatter = grid_eta.clamp(0, H - 1)
             grid_phi_scatter = grid_phi.clamp(0, W - 1)
-    
+
         H_alloc, W_alloc = H + 1, W + 1
         b_idx = torch.arange(B, device=x.device).view(B, 1).expand(B, P)
         flat_idx = (b_idx * H_alloc * W_alloc + grid_eta_scatter * W_alloc + grid_phi_scatter).reshape(-1)
-    
+
         grid_flat = x.new_zeros((B * H_alloc * W_alloc, C))
         grid_flat.scatter_add_(0, flat_idx[:, None].expand(-1, C), x.reshape(-1, C))
-    
+
         if self.scatter_reduce == "mean":
             real = (~pad).to(x.dtype).reshape(-1) if pad is not None else x.new_ones(B * P)
             counts = x.new_zeros((B * H_alloc * W_alloc,))
             counts.scatter_add_(0, flat_idx, real)
             grid_flat = grid_flat / (counts[:, None] + self.eps)
-    
+
         # slice off scratch row/col, conv only sees real cells
         grid = grid_flat.view(B, H_alloc, W_alloc, C)[:, :H, :W, :]
         grid = grid.permute(0, 3, 1, 2).contiguous()
         grid = self.conv2d(grid)
-    
+
         # gather back with clamped real indices
         grid_bhwc = grid.permute(0, 2, 3, 1).contiguous()
         out = grid_bhwc[b_idx, grid_eta.clamp(0, H - 1), grid_phi.clamp(0, W - 1)]
-    
+
         out = self.pointwise(out)
         out = self.norm(out)
         return residual + out
@@ -769,7 +756,7 @@ class ParticleTransformer(nn.Module):
                  phat_message_proj=True,
                  phat_gmp_per_block=False,
                  phat_sort=True,
-                 phat_use_interaction_matrix=False,   # <-- new flag
+                 phat_use_interaction_matrix=False,
                  # standard parT GMP per block (independent of phat)
                  gmp_per_block=False,
                  **kwargs) -> None:
@@ -818,25 +805,19 @@ class ParticleTransformer(nn.Module):
         self.pair_extra_dim = pair_extra_dim
         self.embed = Embed(input_dim, embed_dims, activation=activation) if len(embed_dims) > 0 else nn.Identity()
 
-        # pair_embed for standard parT mode (global attention)
+        # CHANGE 1: pair_embed now initializes for both standard parT AND phat paths.
+        # phat_pair_embed is removed entirely — we compute the full N×N bias upfront
+        # and let _extract_local_attn_mask slice it to intra-patch blocks.
         self.pair_embed = PairEmbed(
             pair_input_dim, pair_extra_dim, pair_embed_dims + [cfg_block['num_heads']],
             remove_self_pair=remove_self_pair, use_pre_activation_pair=use_pre_activation_pair,
             for_onnx=for_inference,
-        ) if (not use_phat) and pair_embed_dims is not None and pair_input_dim + pair_extra_dim > 0 else None
+        ) if pair_embed_dims is not None and pair_input_dim + pair_extra_dim > 0 else None
 
-        # shared PairEmbed for phat interaction matrix.
-        # use_pre_activation_pair=True so the MLP output is raw (no final
-        # activation) before being added directly to attention logits,
-        # consistent with how parT uses the interaction matrix.
-        self.phat_pair_embed = PairEmbed(
-            pair_input_dim, 0, pair_embed_dims + [cfg_block['num_heads']],
-            remove_self_pair=remove_self_pair, use_pre_activation_pair=True,
-            for_onnx=for_inference,
-        ) if use_phat and phat_use_interaction_matrix and pair_embed_dims is not None and pair_input_dim > 0 else None
+        self.phat_pair_embed = None  # removed: full N×N pair_embed replaces this
 
         _logger.info(f"PHAT interaction matrix: phat_use_interaction_matrix={phat_use_interaction_matrix}, "
-                     f"phat_pair_embed={'enabled' if self.phat_pair_embed is not None else 'disabled'}")
+                     f"pair_embed={'enabled' if self.pair_embed is not None else 'disabled'}")
 
         if use_phat:
             self.blocks = nn.ModuleList([
@@ -914,23 +895,23 @@ class ParticleTransformer(nn.Module):
                 else:
                     gmp_pass = self.gmp
 
+                # CHANGE 2: compute full N×N attn_mask upfront from full kinematics,
+                # same as standard parT. _extract_local_attn_mask in each block
+                # slices it down to intra-patch blocks. phat_pair_embed is gone.
                 attn_mask = None
                 if (v is not None or uu is not None) and self.pair_embed is not None:
-                    if v is not None:
-                        v_masked = v.masked_fill(~mask.expand_as(v), 0.0)
-                    else:
-                        v_masked = v
+                    v_masked = v.masked_fill(~mask.expand_as(v), 0.0) if v is not None else v
                     attn_mask = self.pair_embed(v_masked, uu).view(-1, v.size(-1), v.size(-1))
 
                 for block in self.blocks:
                     x = block(
                         x,
                         padding_mask=padding_mask,
-                        attn_mask=attn_mask,
+                        attn_mask=attn_mask,  # full N×N, sliced inside block
                         gmp=gmp_pass,
                         gmp_coords=gmp_coords,
-                        v=v,
-                        pair_embed=self.phat_pair_embed,
+                        v=None,          # no longer needed for per-patch pair_embed
+                        pair_embed=None, # phat_pair_embed removed
                     )
 
             else:
