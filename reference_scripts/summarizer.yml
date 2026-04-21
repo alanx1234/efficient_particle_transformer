@@ -1,0 +1,183 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: alan-summarize-runs
+  namespace: cms-ml
+spec:
+  completions: 1
+  parallelism: 1
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: j-jepa-vol
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi
+
+      containers:
+        - name: eval
+          image: gitlab-registry.nrp-nautilus.io/jmduarte/weaver:latest
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -eux
+              pip install scikit-learn uproot numpy --quiet
+
+              python3 - <<'PYEOF'
+              import numpy as np
+              import os
+              import uproot
+              from sklearn.metrics import accuracy_score, roc_curve, roc_auc_score
+
+              # ── class config (verbatim from backgroundRejection.ipynb) ───────────────────
+              CLASSES    = ['QCD', 'Hbb', 'Hcc', 'Hgg', 'H4q', 'Hqql', 'Zqq', 'Wqq', 'Tbqq', 'Tbl']
+              N_CLASSES  = len(CLASSES)
+              LABEL_LIST = [f'label_{c}' for c in CLASSES]
+              SCORE_LIST = [f'score_label_{c}' for c in CLASSES]
+
+              # files live in run_dir/predict_output/
+              PRED_FILES = [
+                  'pred_HToBB.root',
+                  'pred_HToCC.root',
+                  'pred_HToGG.root',
+                  'pred_HToWW2Q1L.root',
+                  'pred_HToWW4Q.root',
+                  'pred_TTBar.root',
+                  'pred_TTBarLep.root',
+                  'pred_WToQQ.root',
+                  'pred_ZToQQ.root',
+                  'pred_ZJetsToNuNu.root',
+              ]
+
+              # TPR thresholds verbatim from notebook:
+              # i==5 (Hqql) → 0.99, i==9 (Tbl) → 0.995, all others → 0.5
+              def tpr_target(i):
+                  if i == 5: return 0.99
+                  if i == 9: return 0.995
+                  return 0.5
+
+              RUNS_BASE = '/ParTGMP/runs' # edit this for different runs
+              RUNS = {
+                  'partgmp_only': f'{RUNS_BASE}/vanillaparT_10m_fixed'
+              }
+
+
+              def load_pred(run_dir):
+                  """Load all pred_*.root from run_dir/predict_output/. Skips if any file missing."""
+                  predict_dir = os.path.join(run_dir, 'predict_output')
+                  for fname in PRED_FILES:
+                      fpath = os.path.join(predict_dir, fname)
+                      if not os.path.exists(fpath):
+                          raise FileNotFoundError(fpath)
+
+                  arrays = []
+                  for fname in PRED_FILES:
+                      with uproot.open(os.path.join(predict_dir, fname)) as f:
+                          arrays.append(f['Events'].arrays(LABEL_LIST + SCORE_LIST))
+
+                  concat = {k: np.concatenate([a[k].to_numpy() for a in arrays])
+                            for k in LABEL_LIST + SCORE_LIST}
+                  y_prob = np.stack([concat[k] for k in SCORE_LIST], axis=1)
+                  labels = np.stack([concat[k] for k in LABEL_LIST], axis=1).astype(int)
+                  return labels, y_prob
+
+
+              def compute_rejections(labels, y_prob):
+                  """Verbatim port of backgroundRejection.ipynb compute_rejections()."""
+                  overall_roc_auc = roc_auc_score(labels, y_prob, average='macro', multi_class='ovo')
+                  accuracy = accuracy_score(np.argmax(labels, axis=1), np.argmax(y_prob, axis=1))
+
+                  # p_sig / (p_QCD + p_sig)  — verbatim from notebook
+                  scores = y_prob / (y_prob[:, :1] + y_prob)
+
+                  results = {'auc': overall_roc_auc, 'acc': accuracy}
+
+                  for i in range(1, N_CLASSES):
+                      percent = tpr_target(i)
+
+                      mask          = (labels[:, 0] == 1) | (labels[:, i] == 1)
+                      binary_labels = (labels[mask][:, i] == 1).astype(int)
+                      binary_scores = scores[mask][:, i]
+
+                      fpr, tpr, _ = roc_curve(binary_labels, binary_scores)
+
+                      # first index where tpr >= threshold (verbatim: valid = np.where(tpr >= percent)[0])
+                      valid = np.where(tpr >= percent)[0]
+                      if len(valid) == 0:
+                          rejection = float('nan')
+                      else:
+                          idx = valid[0]
+                          rejection = 1.0 / fpr[idx] if fpr[idx] != 0.0 else float('inf')
+
+                      results[CLASSES[i]] = rejection
+
+                  return results
+
+
+              def fv(v, is_float=False):
+                  if isinstance(v, float) and np.isnan(v): return 'nan'
+                  if isinstance(v, float) and np.isinf(v): return 'inf'
+                  if is_float: return f'{v:.4f}'
+                  return str(int(round(v)))
+
+
+              print()
+              print('=' * 60)
+              print('Column order: Dataset | Accuracy | AUC | H->bb | H->cc | H->gg | H->4q | H->lvqq | t->bqq | t->blv | W->qq | Z->qq')
+              print('Paste each tab-separated row directly into Notion.')
+              print('=' * 60)
+              print()
+
+              for run_name, run_dir in RUNS.items():
+                  try:
+                      labels, y_prob = load_pred(run_dir)
+                  except FileNotFoundError as e:
+                      print(f'[SKIPPED] {run_name}  (missing: {e})')
+                      continue
+                  except Exception as e:
+                      print(f'[ERROR]   {run_name}: {e}')
+                      continue
+
+                  r = compute_rejections(labels, y_prob)
+
+                  # tab-separated, same column order as screenshot table
+                  row = '\t'.join([
+                      run_name,
+                      fv(r['acc'], is_float=True),
+                      fv(r['auc'], is_float=True),
+                      fv(r['Hbb']),
+                      fv(r['Hcc']),
+                      fv(r['Hgg']),
+                      fv(r['H4q']),
+                      fv(r['Hqql']),
+                      fv(r['Tbqq']),
+                      fv(r['Tbl']),
+                      fv(r['Wqq']),
+                      fv(r['Zqq']),
+                  ])
+                  print(f'[OK] {run_name}')
+                  print(row)
+                  print()
+
+              print('=' * 60)
+              print('DONE')
+              PYEOF
+
+          volumeMounts:
+            - name: work
+              mountPath: /ParTGMP
+            - name: dshm
+              mountPath: /dev/shm
+
+          resources:
+            limits:
+              memory: 32Gi
+              cpu: "4"
+            requests:
+              memory: 32Gi
+              cpu: "4"
