@@ -57,15 +57,17 @@ spec:
               # TPR thresholds verbatim from notebook:
               # i==5 (Hqql) → 0.99, i==9 (Tbl) → 0.995, all others → 0.5
               def tpr_target(i):
-                  if i == 5: return 0.99
-                  if i == 9: return 0.995
+                  if i == 5:
+                      return 0.99
+                  if i == 9:
+                      return 0.995
                   return 0.5
 
-              RUNS_BASE = '/ParTGMP/runs' 
-              RUNS = { # edit or add runs here
-                  'partgmp_only': f'{RUNS_BASE}/vanillaparT_10m_fixed'
+              RUNS_BASE = '/ParTGMP/runs'
+              RUNS = {  # edit or add runs here
+                  'partgmp_only_perblock': f'{RUNS_BASE}/partgmp_noim_gmpperblock_2m/',
+                  'partgmp_only_once': f'{RUNS_BASE}/partgmp_noim_gmponce_2m/'
               }
-
 
               def load_pred(run_dir):
                   """Load all pred_*.root from run_dir/predict_output/. Skips if any file missing."""
@@ -80,19 +82,20 @@ spec:
                       with uproot.open(os.path.join(predict_dir, fname)) as f:
                           arrays.append(f['Events'].arrays(LABEL_LIST + SCORE_LIST))
 
-                  concat = {k: np.concatenate([a[k].to_numpy() for a in arrays])
-                            for k in LABEL_LIST + SCORE_LIST}
+                  concat = {
+                      k: np.concatenate([a[k].to_numpy() for a in arrays])
+                      for k in LABEL_LIST + SCORE_LIST
+                  }
                   y_prob = np.stack([concat[k] for k in SCORE_LIST], axis=1)
                   labels = np.stack([concat[k] for k in LABEL_LIST], axis=1).astype(int)
                   return labels, y_prob
-
 
               def compute_rejections(labels, y_prob):
                   """Verbatim port of backgroundRejection.ipynb compute_rejections()."""
                   overall_roc_auc = roc_auc_score(labels, y_prob, average='macro', multi_class='ovo')
                   accuracy = accuracy_score(np.argmax(labels, axis=1), np.argmax(y_prob, axis=1))
 
-                  # p_sig / (p_QCD + p_sig)  — verbatim from notebook
+                  # p_sig / (p_QCD + p_sig) — verbatim from notebook
                   scores = y_prob / (y_prob[:, :1] + y_prob)
 
                   results = {'auc': overall_roc_auc, 'acc': accuracy}
@@ -100,13 +103,13 @@ spec:
                   for i in range(1, N_CLASSES):
                       percent = tpr_target(i)
 
-                      mask          = (labels[:, 0] == 1) | (labels[:, i] == 1)
+                      mask = (labels[:, 0] == 1) | (labels[:, i] == 1)
                       binary_labels = (labels[mask][:, i] == 1).astype(int)
                       binary_scores = scores[mask][:, i]
 
                       fpr, tpr, _ = roc_curve(binary_labels, binary_scores)
 
-                      # first index where tpr >= threshold (verbatim: valid = np.where(tpr >= percent)[0])
+                      # first index where tpr >= threshold
                       valid = np.where(tpr >= percent)[0]
                       if len(valid) == 0:
                           rejection = float('nan')
@@ -118,18 +121,18 @@ spec:
 
                   return results
 
-
               def fv(v, is_float=False):
-                  if isinstance(v, float) and np.isnan(v): return 'nan'
-                  if isinstance(v, float) and np.isinf(v): return 'inf'
-                  if is_float: return f'{v:.4f}'
+                  if isinstance(v, float) and np.isnan(v):
+                      return 'nan'
+                  if isinstance(v, float) and np.isinf(v):
+                      return 'inf'
+                  if is_float:
+                      return f'{v:.4f}'
                   return str(int(round(v)))
-
 
               print()
               print('=' * 60)
               print('Column order: Dataset | Accuracy | AUC | H->bb | H->cc | H->gg | H->4q | H->lvqq | t->bqq | t->blv | W->qq | Z->qq')
-              print('Paste each tab-separated row directly into Notion.')
               print('=' * 60)
               print()
 
