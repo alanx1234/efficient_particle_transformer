@@ -4,9 +4,11 @@ metadata:
   name: alan-cluster-kmeans-sweep
   namespace: cms-ml
 spec:
-  completions: 5
-  parallelism: 5
-  # idx 0-3: k=8,16,24,32 (beta=True)  idx 4: k=16 beta=False ablation
+  completions: 6
+  parallelism: 6
+  # idx 0-3: k=8,16,24,32 (relative, beta=True)
+  # idx 4: k=16 relative beta=False ablation
+  # idx 5: k=16 raw beta=True ablation
   completionMode: Indexed
   backoffLimit: 2
   ttlSecondsAfterFinished: 604800
@@ -42,28 +44,31 @@ spec:
             - |
               set -eux
 
-              pip install hdbscan pyjet -q
+              pip install hdbscan -q
 
               export DATADIR_JetClass=/ParTGMP/JetClass
               export DDP_NGPUS=1
 
               IDX=${JOB_COMPLETION_INDEX}
 
-              # 0: k=8   1: k=16   2: k=24   3: k=32   4: k=16 beta=False ablation
+              # 0-3: k=8,16,24,32 relative beta=True
+              # 4: k=16 relative beta=False ablation
+              # 5: k=16 raw beta=True ablation
               if [ "$IDX" -eq 0 ]; then
-                GMP_K=8;  BETA=True;  SUFFIX="kmeans_k8_raw"
+                GMP_K=8;  BETA=True;  GMP_COORDS='"relative"'; SUFFIX="kmeans_k8_rel"
               elif [ "$IDX" -eq 1 ]; then
-                GMP_K=16; BETA=True;  SUFFIX="kmeans_k16_raw"
+                GMP_K=16; BETA=True;  GMP_COORDS='"relative"'; SUFFIX="kmeans_k16_rel"
               elif [ "$IDX" -eq 2 ]; then
-                GMP_K=24; BETA=True;  SUFFIX="kmeans_k24_raw"
+                GMP_K=24; BETA=True;  GMP_COORDS='"relative"'; SUFFIX="kmeans_k24_rel"
               elif [ "$IDX" -eq 3 ]; then
-                GMP_K=32; BETA=True;  SUFFIX="kmeans_k32_raw"
+                GMP_K=32; BETA=True;  GMP_COORDS='"relative"'; SUFFIX="kmeans_k32_rel"
+              elif [ "$IDX" -eq 4 ]; then
+                GMP_K=16; BETA=False; GMP_COORDS='"relative"'; SUFFIX="kmeans_k16_rel_fixedbeta"
               else
-                GMP_K=16; BETA=False; SUFFIX="kmeans_k16_raw_fixedbeta"
+                GMP_K=16; BETA=True;  GMP_COORDS='"raw"';      SUFFIX="kmeans_k16_raw"
               fi
 
               GMP_REDUCE='"sum"'
-              GMP_COORDS='"raw"'
               GMP_CLUSTER='"kmeans"'
 
               SAMPLES_PER_EPOCH=2000000

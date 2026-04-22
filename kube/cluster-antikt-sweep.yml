@@ -42,7 +42,7 @@ spec:
             - |
               set -eux
 
-              pip install hdbscan pyjet -q
+              pip install pyjet -q
 
               export DATADIR_JetClass=/ParTGMP/JetClass
               export DDP_NGPUS=1
