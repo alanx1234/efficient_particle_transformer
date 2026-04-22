@@ -1,0 +1,162 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: alan-cluster-antikt-sweep
+  namespace: cms-ml
+spec:
+  completions: 4
+  parallelism: 4
+  # idx 0: R=0.1  idx 1: R=0.2  idx 2: R=0.3  idx 3: R=0.4
+  completionMode: Indexed
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 604800
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-A40
+                      - NVIDIA-L40
+                      - NVIDIA-GeForce-RTX-4090
+                      - NVIDIA-GeForce-RTX-3090
+      restartPolicy: Never
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: j-jepa-vol
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+
+      containers:
+        - name: training
+          image: gitlab-registry.nrp-nautilus.io/jmduarte/weaver:latest
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -eux
+
+              pip install hdbscan pyjet -q
+
+              export DATADIR_JetClass=/ParTGMP/JetClass
+              export DDP_NGPUS=1
+
+              IDX=${JOB_COMPLETION_INDEX}
+
+              # Stage 1: sweep antikt_R with fixed gmp_k=16
+              # 0: R=0.1   1: R=0.2   2: R=0.3   3: R=0.4
+              if [ "$IDX" -eq 0 ]; then
+                ANTIKT_R=0.1; GMP_K=16; SUFFIX="antikt_R0p1_k16"
+              elif [ "$IDX" -eq 1 ]; then
+                ANTIKT_R=0.2; GMP_K=16; SUFFIX="antikt_R0p2_k16"
+              elif [ "$IDX" -eq 2 ]; then
+                ANTIKT_R=0.3; GMP_K=16; SUFFIX="antikt_R0p3_k16"
+              else
+                ANTIKT_R=0.4; GMP_K=16; SUFFIX="antikt_R0p4_k16"
+              fi
+
+              GMP_REDUCE='"sum"'
+              GMP_COORDS='"raw"'
+              GMP_CLUSTER='"antikt"'
+
+              SAMPLES_PER_EPOCH=2000000
+              N_FILES=2
+              NUM_WORKERS=2
+
+              REPO_DIR="/ParTGMP/repos/${SUFFIX}"
+              LOG_DIR="/ParTGMP/logs/${SUFFIX}"
+              RUN_DIR="/ParTGMP/runs/${SUFFIX}"
+
+              if [ -d "$REPO_DIR/.git" ]; then
+                cd "$REPO_DIR"
+                git fetch --all
+                git checkout cluster || true
+                git pull || true
+              else
+                mkdir -p "$(dirname "$REPO_DIR")"
+                git clone https://github.com/alanx1234/efficient_particle_transformer.git "$REPO_DIR"
+                cd "$REPO_DIR"
+                git checkout cluster || true
+              fi
+
+              cd "$REPO_DIR"
+
+              WEAVER_DIR="/ParTGMP/weaver-core"
+              if [ ! -d "$WEAVER_DIR/.git" ]; then
+                git clone https://github.com/hqucms/weaver-core.git "$WEAVER_DIR"
+              fi
+              pip install -e "$WEAVER_DIR" --no-deps -q
+
+              mkdir -p "${RUN_DIR}/predict_output" "${LOG_DIR}"
+
+              export PYTHONPATH="$REPO_DIR:${PYTHONPATH:-}"
+
+              D="${DATADIR_JetClass}/Pythia"
+
+              TRAIN_FILES=""
+              for CLS in HToBB HToCC HToGG HToWW2Q1L HToWW4Q TTBar TTBarLep WToQQ ZToQQ ZJetsToNuNu; do
+                for i in $(seq 0 $((N_FILES - 1))); do
+                  TRAIN_FILES="$TRAIN_FILES ${CLS}:${D}/train_100M/${CLS}_$(printf '%03d' $i).root"
+                done
+              done
+
+              weaver \
+                --data-train $TRAIN_FILES \
+                --data-val "${D}/val_5M/*.root" \
+                --data-test \
+                  "HToBB:${D}/test_20M/HToBB_*.root" \
+                  "HToCC:${D}/test_20M/HToCC_*.root" \
+                  "HToGG:${D}/test_20M/HToGG_*.root" \
+                  "HToWW2Q1L:${D}/test_20M/HToWW2Q1L_*.root" \
+                  "HToWW4Q:${D}/test_20M/HToWW4Q_*.root" \
+                  "TTBar:${D}/test_20M/TTBar_*.root" \
+                  "TTBarLep:${D}/test_20M/TTBarLep_*.root" \
+                  "WToQQ:${D}/test_20M/WToQQ_*.root" \
+                  "ZToQQ:${D}/test_20M/ZToQQ_*.root" \
+                  "ZJetsToNuNu:${D}/test_20M/ZJetsToNuNu_*.root" \
+                --data-config data/JetClass/JetClass_full.yaml \
+                --network-config networks/example_ParticleTransformerClustering.py \
+                --network-option use_gmp True \
+                --network-option gmp_coords $GMP_COORDS \
+                --network-option gmp_kernel 3 \
+                --network-option gmp_grid 0.05 \
+                --network-option gmp_reduce $GMP_REDUCE \
+                --network-option gmp_cluster $GMP_CLUSTER \
+                --network-option gmp_k ${GMP_K} \
+                --network-option antikt_R ${ANTIKT_R} \
+                --network-option gmp_cluster_combine_mlp True \
+                --use-amp \
+                --model-prefix "${RUN_DIR}/net" \
+                --num-epochs 50 \
+                --batch-size 512 \
+                --start-lr 1e-3 \
+                --optimizer ranger \
+                --fetch-step 0.01 \
+                --num-workers ${NUM_WORKERS} \
+                --samples-per-epoch ${SAMPLES_PER_EPOCH} \
+                --samples-per-epoch-val 5000000 \
+                --gpus 0 \
+                --log "${LOG_DIR}/train.log" \
+                --predict-output "${RUN_DIR}/predict_output/pred.root"
+
+          volumeMounts:
+            - name: work
+              mountPath: /ParTGMP
+            - name: dshm
+              mountPath: /dev/shm
+
+          resources:
+            limits:
+              memory: 128Gi
+              cpu: "12"
+              nvidia.com/gpu: "1"
+            requests:
+              memory: 128Gi
+              cpu: "12"
+              nvidia.com/gpu: "1"

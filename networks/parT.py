@@ -12,6 +12,18 @@ from functools import partial
 
 from networks.logger import _logger
 
+try:
+    import hdbscan as hdbscan_lib
+    HDBSCAN_AVAILABLE = True
+except ImportError:
+    HDBSCAN_AVAILABLE = False
+
+try:
+    import pyjet
+    PYJET_AVAILABLE = True
+except ImportError:
+    PYJET_AVAILABLE = False
+
 
 @torch.jit.script
 def delta_phi(a, b):
@@ -467,6 +479,11 @@ class GeometricMessagePassing(nn.Module):
         grid_size: float = 0.05,
         scatter_reduce: str = "sum",   # "sum" or "mean"
         eps: float = 1e-6,
+        cluster_mode: str = "grid",
+        cluster_k: int = 16,
+        cluster_beta: bool = True,
+        cluster_combine_mlp: bool = True,
+        antikt_R: float = 0.2,
     ):
         super().__init__()
         assert scatter_reduce in ("sum", "mean")
@@ -486,13 +503,50 @@ class GeometricMessagePassing(nn.Module):
         self.pointwise = nn.Linear(channels, channels, bias=True)
         self.norm = nn.LayerNorm(channels, eps=1e-6)
 
+        self.cluster_mode = cluster_mode
+        self.cluster_k = cluster_k
+        self.antikt_R = antikt_R
+        self.cluster_combine_mlp = cluster_combine_mlp
+
+        if cluster_mode == "kmeans":
+            self.centroids = nn.Parameter(torch.randn(cluster_k, 2) * 0.1)
+            if cluster_beta:
+                self.beta = nn.Parameter(torch.ones(1))
+            else:
+                self.register_buffer("beta", torch.ones(1))
+
+        elif cluster_mode == "hdbscan":
+            if not HDBSCAN_AVAILABLE:
+                raise ImportError(
+                    "hdbscan package required for cluster_mode='hdbscan'. "
+                    "Run: pip install hdbscan"
+                )
+
+        elif cluster_mode == "antikt":
+            if not PYJET_AVAILABLE:
+                raise ImportError(
+                    "pyjet package required for cluster_mode='antikt'. "
+                    "Run: pip install pyjet"
+                )
+
+        if cluster_combine_mlp and cluster_mode != "grid":
+            self.cluster_mlp = nn.Sequential(
+                nn.Linear(channels * 2, channels),
+                nn.GELU(),
+                nn.Linear(channels, channels)
+            )
+
     def forward(
         self,
         x: torch.Tensor,
         c1: torch.Tensor,
         c2: torch.Tensor,
         pad: torch.Tensor | None = None,
+        v: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self.cluster_mode != "grid":
+            return self._forward_cluster(x, c1, c2, pad, v=v)
+
         B, P, C = x.shape
         assert C == self.channels
         residual = x
@@ -561,6 +615,232 @@ class GeometricMessagePassing(nn.Module):
         out = self.norm(out)
         return residual + out
 
+    # ------------------------------------------------------------------
+    # Clustering helpers
+    # ------------------------------------------------------------------
+
+    def _cluster_aggregate_broadcast(self, x, a, residual):
+        # x: (B, P, C)  a: (B, P, K)  residual: (B, P, C)
+        c = torch.einsum("bpk,bpc->bkc", a, x)  # (B, K, C)
+        weights = a.sum(dim=1, keepdim=True).transpose(1, 2) + 1e-6  # (B, K, 1)
+        c = c / weights
+        pool = torch.einsum("bpk,bkc->bpc", a, c)  # (B, P, C)
+        if self.cluster_combine_mlp:
+            out = self.cluster_mlp(torch.cat([x, pool], dim=-1))
+        else:
+            out = pool
+        out = self.norm(out)
+        return residual + out
+
+    def _forward_cluster(self, x, c1, c2, pad, v=None):
+        if self.cluster_mode == "kmeans":
+            return self._forward_kmeans(x, c1, c2, pad)
+        elif self.cluster_mode == "hdbscan":
+            return self._forward_hdbscan(x, c1, c2, pad)
+        elif self.cluster_mode == "antikt":
+            return self._forward_antikt(x, pad, v=v)
+        else:
+            raise ValueError(f"Unknown cluster_mode: {self.cluster_mode}")
+
+    def _forward_kmeans(self, x, c1, c2, pad):
+        residual = x
+
+        coords = torch.stack([c1, c2], dim=-1)  # (B, P, 2)
+        diff = coords.unsqueeze(2) - self.centroids.unsqueeze(0).unsqueeze(0)
+        dists = (diff ** 2).sum(dim=-1)  # (B, P, K)
+        a = torch.softmax(-self.beta * dists, dim=-1)  # (B, P, K)
+
+        if pad is not None:
+            a = a.masked_fill(pad.unsqueeze(-1), 0.0)
+
+        return self._cluster_aggregate_broadcast(x, a, residual)
+
+    def _forward_hdbscan(self, x, c1, c2, pad):
+        import numpy as np
+
+        B, P, _ = x.shape
+        residual = x
+
+        c1_np = c1.detach().cpu().numpy()
+        c2_np = c2.detach().cpu().numpy()
+        pad_np = pad.cpu().numpy() if pad is not None else None
+
+        a = torch.zeros(B, P, self.cluster_k, dtype=x.dtype, device=x.device)
+
+        for b in range(B):
+            if pad_np is not None:
+                mask_b = ~pad_np[b]
+            else:
+                mask_b = np.ones(P, dtype=bool)
+
+            original_indices = np.where(mask_b)[0]
+            n_real = len(original_indices)
+            if n_real == 0:
+                continue
+
+            real_coords = np.stack(
+                [c1_np[b][mask_b], c2_np[b][mask_b]], axis=1
+            )
+
+            clusterer = hdbscan_lib.HDBSCAN(
+                min_cluster_size=max(2, n_real // (self.cluster_k * 2)),
+                min_samples=1,
+                core_dist_n_jobs=1,
+            )
+            labels = clusterer.fit_predict(real_coords)
+
+            valid_labels = np.unique(labels[labels >= 0])
+            if len(valid_labels) == 0:
+                labels = np.zeros_like(labels)
+                valid_labels = np.array([0])
+
+            if np.any(labels == -1):
+                centroids_np = np.array([
+                    real_coords[labels == lbl].mean(axis=0)
+                    for lbl in valid_labels
+                ])
+                noise_idx = np.where(labels == -1)[0]
+                for ni in noise_idx:
+                    d = np.sum((centroids_np - real_coords[ni]) ** 2, axis=1)
+                    nearest_lbl = valid_labels[np.argmin(d)]
+                    labels[ni] = nearest_lbl
+
+            unique_labels = np.unique(labels)
+
+            if len(unique_labels) > self.cluster_k:
+                counts = np.array([np.sum(labels == lbl) for lbl in unique_labels])
+                sorted_labels = unique_labels[np.argsort(-counts)]
+                keep_labels = sorted_labels[:self.cluster_k]
+
+                keep_centroids = np.array([
+                    real_coords[labels == lbl].mean(axis=0)
+                    for lbl in keep_labels
+                ])
+
+                for lbl in sorted_labels[self.cluster_k:]:
+                    lbl_centroid = real_coords[labels == lbl].mean(axis=0)
+                    d = np.sum((keep_centroids - lbl_centroid) ** 2, axis=1)
+                    nearest_keep = keep_labels[np.argmin(d)]
+                    labels[labels == lbl] = nearest_keep
+
+            final_labels = np.unique(labels)
+            label_map = {old: new for new, old in enumerate(final_labels)}
+            remapped = np.array([label_map[lbl] for lbl in labels])
+
+            for p_local, p_orig in enumerate(original_indices):
+                cluster_idx = remapped[p_local]
+                if cluster_idx < self.cluster_k:
+                    a[b, p_orig, cluster_idx] = 1.0
+
+        return self._cluster_aggregate_broadcast(x, a, residual)
+
+    def _forward_antikt(self, x, pad, v=None):
+        import numpy as np
+
+        B, P, _ = x.shape
+        residual = x
+
+        if v is None:
+            raise ValueError("anti-kt clustering requires raw 4-vectors v")
+
+        # v is in original (N, 4, P) layout, as expected by compute_eta_phi_from_p4
+        eta_raw, phi_raw = compute_eta_phi_from_p4(v)
+        px, py = v[:, 0, :], v[:, 1, :]
+        pt = torch.sqrt(px * px + py * py + 1e-8)
+
+        eta_np = eta_raw.detach().cpu().numpy()
+        phi_np = phi_raw.detach().cpu().numpy()
+        pt_np = pt.detach().cpu().numpy()
+        pad_np = pad.cpu().numpy() if pad is not None else None
+
+        a = torch.zeros(B, P, self.cluster_k, dtype=x.dtype, device=x.device)
+
+        for b in range(B):
+            if pad_np is not None:
+                mask_b = ~pad_np[b]
+            else:
+                mask_b = np.ones(P, dtype=bool)
+
+            original_indices = np.where(mask_b)[0]
+            n_real = len(original_indices)
+            if n_real == 0:
+                continue
+
+            pseudojets = np.zeros(
+                n_real,
+                dtype=np.dtype([
+                    ("pt", "f8"),
+                    ("eta", "f8"),
+                    ("phi", "f8"),
+                    ("mass", "f8"),
+                ])
+            )
+            pseudojets["pt"] = pt_np[b][mask_b]
+            pseudojets["eta"] = eta_np[b][mask_b]
+            pseudojets["phi"] = phi_np[b][mask_b]
+            pseudojets["mass"] = 0.0
+
+            R_val = float(np.clip(self.antikt_R, 0.05, 1.0))
+            sequence = pyjet.cluster(pseudojets, R=R_val, p=-1)
+            subjets = sequence.inclusive_jets(ptmin=0.0)
+            subjets_sorted = sorted(subjets, key=lambda j: j.pt, reverse=True)
+
+            if len(subjets_sorted) == 0:
+                a[b, original_indices, 0] = 1.0
+                continue
+
+            real_eta = eta_np[b][mask_b]
+            real_phi = phi_np[b][mask_b]
+
+            kept_subjets = subjets_sorted[:self.cluster_k]
+            kept_centroids = np.array([[sj.eta, sj.phi] for sj in kept_subjets])
+
+            local_assign = np.full(n_real, -1, dtype=np.int64)
+            # Tracks which local indices have been claimed to prevent double-assignment.
+            used_global = set()
+
+            def match_constituent(c_eta, c_phi):
+                # pyjet 1.9+ does not expose userindex; match by exact kinematics
+                # (constituent eta/phi equals the original input particle's values).
+                dphi = np.arctan2(np.sin(real_phi - c_phi), np.cos(real_phi - c_phi))
+                dists = (real_eta - c_eta) ** 2 + dphi ** 2
+                for taken in used_global:
+                    dists[taken] = np.inf
+                local_idx = int(np.argmin(dists))
+                return local_idx if np.isfinite(dists[local_idx]) else -1
+
+            def assign_subjet(subjet, cluster_idx):
+                for constituent in subjet.constituents():
+                    local_idx = match_constituent(constituent.eta, constituent.phi)
+                    if local_idx >= 0 and local_idx not in used_global:
+                        local_assign[local_idx] = cluster_idx
+                        used_global.add(local_idx)
+
+            for subjet_idx, subjet in enumerate(kept_subjets):
+                assign_subjet(subjet, subjet_idx)
+
+            for subjet in subjets_sorted[self.cluster_k:]:
+                subjet_eta, subjet_phi = subjet.eta, subjet.phi
+                dphi = np.arctan2(np.sin(kept_centroids[:, 1] - subjet_phi),
+                                  np.cos(kept_centroids[:, 1] - subjet_phi))
+                dists = (kept_centroids[:, 0] - subjet_eta) ** 2 + dphi ** 2
+                nearest_keep = int(np.argmin(dists))
+                assign_subjet(subjet, nearest_keep)
+
+            # Final fallback: any still-unassigned particle goes to its nearest kept subjet.
+            if np.any(local_assign < 0):
+                for local_idx in np.where(local_assign < 0)[0]:
+                    dphi = np.arctan2(np.sin(kept_centroids[:, 1] - real_phi[local_idx]),
+                                      np.cos(kept_centroids[:, 1] - real_phi[local_idx]))
+                    dists = (kept_centroids[:, 0] - real_eta[local_idx]) ** 2 + dphi ** 2
+                    local_assign[local_idx] = int(np.argmin(dists))
+
+            for p_local, p_orig in enumerate(original_indices):
+                a[b, p_orig, local_assign[p_local]] = 1.0
+
+        return self._cluster_aggregate_broadcast(x, a, residual)
+
+
 def compute_eta_phi_from_p4(v: torch.Tensor, eps: float = 1e-8):
     """
     v: [N, 4, P] with [px, py, pz, E]
@@ -622,6 +902,11 @@ class ParticleTransformer(nn.Module):
                  gmp_kernel = 3,
                  gmp_grid = 0.2,
                  gmp_reduce = "sum",
+                 gmp_cluster = "grid",
+                 gmp_k = 16,
+                 gmp_cluster_beta = True,
+                 gmp_cluster_combine_mlp = True,
+                 antikt_R = 0.2,
                  **kwargs) -> None:
         super().__init__(**kwargs)
 
@@ -640,9 +925,19 @@ class ParticleTransformer(nn.Module):
                 kernel_size=gmp_kernel,
                 grid_size=gmp_grid,
                 scatter_reduce=gmp_reduce,
+                cluster_mode=gmp_cluster,
+                cluster_k=gmp_k,
+                cluster_beta=gmp_cluster_beta,
+                cluster_combine_mlp=gmp_cluster_combine_mlp,
+                antikt_R=antikt_R,
             )
 
-        _logger.info(f"GMP ENABLED: use_gmp={use_gmp}, grid={gmp_grid}, coords={gmp_coords}, kernel={gmp_kernel}")
+        _logger.info(
+            f"GMP ENABLED: use_gmp={use_gmp}, grid={gmp_grid}, "
+            f"coords={gmp_coords}, kernel={gmp_kernel}, "
+            f"cluster={gmp_cluster}, K={gmp_k}, "
+            f"antikt_R={antikt_R}, combine_mlp={gmp_cluster_combine_mlp}"
+        )
 
         default_cfg = dict(embed_dim=embed_dim, num_heads=num_heads, ffn_ratio=4,
                            dropout=0.1, attn_dropout=0.1, activation_dropout=0.1,
@@ -723,7 +1018,7 @@ class ParticleTransformer(nn.Module):
                     else:
                         c1, c2 = eta, phi_centered
             
-                x_bpc = self.gmp(x_bpc, c1, c2, pad=pad)
+                x_bpc = self.gmp(x_bpc, c1, c2, pad=pad, v=v)
                 x = x_bpc.permute(1, 0, 2).contiguous() # back to (P,N,C)
             
             if v is not None and self.pair_embed is not None:
@@ -782,8 +1077,20 @@ class ParticleTransformerTagger(nn.Module):
                  gmp_kernel = 3,
                  gmp_grid = 0.05,
                  gmp_reduce = "sum",
+                 gmp_cluster = "grid",
+                 gmp_k = 16,
+                 gmp_cluster_beta = True,
+                 gmp_cluster_combine_mlp = True,
+                 antikt_R = 0.2,
                  **kwargs) -> None:
         super().__init__(**kwargs)
+
+        if gmp_cluster != "grid" and gmp_coords == "relative":
+            raise ValueError(
+                "gmp_coords='relative' requires `points` (deta/dphi) to be passed into "
+                "ParticleTransformer.forward, but ParticleTransformerTagger never passes "
+                "points. Use gmp_coords='raw' for clustering inside the tagger."
+            )
 
         self.use_amp = use_amp
 
@@ -817,7 +1124,12 @@ class ParticleTransformerTagger(nn.Module):
                                         gmp_coords=gmp_coords,
                                         gmp_kernel=gmp_kernel,
                                         gmp_grid=gmp_grid,
-                                        gmp_reduce=gmp_reduce,)
+                                        gmp_reduce=gmp_reduce,
+                                        gmp_cluster=gmp_cluster,
+                                        gmp_k=gmp_k,
+                                        gmp_cluster_beta=gmp_cluster_beta,
+                                        gmp_cluster_combine_mlp=gmp_cluster_combine_mlp,
+                                        antikt_R=antikt_R,)
 
     @torch.jit.ignore
     def no_weight_decay(self):
