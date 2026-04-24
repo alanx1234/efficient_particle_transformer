@@ -1,0 +1,135 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: alan-baseline-part-2m
+  namespace: cms-ml
+spec:
+  completions: 1
+  parallelism: 1
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 604800
+  template:
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-A40
+                      - NVIDIA-L40
+                      - NVIDIA-GeForce-RTX-4090
+                      - NVIDIA-GeForce-RTX-3090
+      restartPolicy: Never
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: j-jepa-vol
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+
+      containers:
+        - name: training
+          image: gitlab-registry.nrp-nautilus.io/jmduarte/weaver:latest
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -eux
+
+              SUFFIX="baseline_part_2m"
+
+              REPO_DIR="/ParTGMP/repos/${SUFFIX}"
+              LOG_DIR="/ParTGMP/logs/${SUFFIX}"
+              RUN_DIR="/ParTGMP/runs/${SUFFIX}"
+
+              if [ -d "$REPO_DIR/.git" ]; then
+                cd "$REPO_DIR"
+                git fetch --all
+                git checkout efficient || true
+                git pull || true
+              else
+                mkdir -p "$(dirname "$REPO_DIR")"
+                git clone https://github.com/alanx1234/efficient_particle_transformer.git "$REPO_DIR"
+                cd "$REPO_DIR"
+                git checkout efficient || true
+              fi
+
+              cd "$REPO_DIR"
+
+              WEAVER_DIR="/ParTGMP/weaver-core"
+              if [ ! -d "$WEAVER_DIR/.git" ]; then
+                git clone https://github.com/hqucms/weaver-core.git "$WEAVER_DIR"
+              fi
+              pip install -e "$WEAVER_DIR" --no-deps -q
+
+              mkdir -p "${RUN_DIR}/predict_output" "${LOG_DIR}"
+
+              export PYTHONPATH="$REPO_DIR:${PYTHONPATH:-}"
+
+              D="${DATADIR_JetClass}/Pythia"
+              N_FILES=2
+              SAMPLES_PER_EPOCH=2000000
+
+              TRAIN_FILES=""
+              for CLS in HToBB HToCC HToGG HToWW2Q1L HToWW4Q TTBar TTBarLep WToQQ ZToQQ ZJetsToNuNu; do
+                for i in $(seq 0 $((N_FILES - 1))); do
+                  TRAIN_FILES="$TRAIN_FILES ${CLS}:${D}/train_100M/${CLS}_$(printf '%03d' $i).root"
+                done
+              done
+
+              export DATADIR_JetClass=/ParTGMP/JetClass
+              export DDP_NGPUS=1
+
+              weaver \
+                --data-train $TRAIN_FILES \
+                --data-val "${D}/val_5M/*.root" \
+                --data-test \
+                  "HToBB:${D}/test_20M/HToBB_*.root" \
+                  "HToCC:${D}/test_20M/HToCC_*.root" \
+                  "HToGG:${D}/test_20M/HToGG_*.root" \
+                  "HToWW2Q1L:${D}/test_20M/HToWW2Q1L_*.root" \
+                  "HToWW4Q:${D}/test_20M/HToWW4Q_*.root" \
+                  "TTBar:${D}/test_20M/TTBar_*.root" \
+                  "TTBarLep:${D}/test_20M/TTBarLep_*.root" \
+                  "WToQQ:${D}/test_20M/WToQQ_*.root" \
+                  "ZToQQ:${D}/test_20M/ZToQQ_*.root" \
+                  "ZJetsToNuNu:${D}/test_20M/ZJetsToNuNu_*.root" \
+                --data-config data/JetClass/JetClass_full.yaml \
+                --network-config networks/example_ParticleTransformer.py \
+                --use-amp \
+                --model-prefix "${RUN_DIR}/net" \
+                --num-epochs 50 \
+                --batch-size 512 \
+                --start-lr 1e-3 \
+                --optimizer ranger \
+                --fetch-step 0.01 \
+                --num-workers 2 \
+                --samples-per-epoch ${SAMPLES_PER_EPOCH} \
+                --samples-per-epoch-val 5000000 \
+                --gpus 0 \
+                --log "${LOG_DIR}/train.log" \
+                --predict-output "${RUN_DIR}/predict_output/pred.root"
+
+          env:
+            - name: DATADIR_JetClass
+              value: /ParTGMP/JetClass
+
+          volumeMounts:
+            - name: work
+              mountPath: /ParTGMP
+            - name: dshm
+              mountPath: /dev/shm
+
+          resources:
+            limits:
+              memory: 128Gi
+              cpu: "12"
+              nvidia.com/gpu: "1"
+            requests:
+              memory: 128Gi
+              cpu: "12"
+              nvidia.com/gpu: "1"
