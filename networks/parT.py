@@ -682,12 +682,16 @@ class GeometricMessagePassing(nn.Module):
                 [c1_np[b][mask_b], c2_np[b][mask_b]], axis=1
             )
 
-            clusterer = hdbscan_lib.HDBSCAN(
-                min_cluster_size=max(2, n_real // (self.cluster_k * 2)),
-                min_samples=1,
-                core_dist_n_jobs=1,
-            )
-            labels = clusterer.fit_predict(real_coords)
+            if n_real < 4:
+                labels = np.zeros(n_real, dtype=np.intp)
+            else:
+                min_cluster_size = max(2, min(n_real // (self.cluster_k * 2), n_real - 1))
+                clusterer = hdbscan_lib.HDBSCAN(
+                    min_cluster_size=min_cluster_size,
+                    min_samples=1,
+                    core_dist_n_jobs=1,
+                )
+                labels = clusterer.fit_predict(real_coords)
 
             valid_labels = np.unique(labels[labels >= 0])
             if len(valid_labels) == 0:

@@ -1,12 +1,14 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: alan-cluster-antikt-sweep
+  name: alan-cluster-kmeans-sweep-paper2m
   namespace: cms-ml
 spec:
-  completions: 4
-  parallelism: 4
-  # idx 0: R=0.1  idx 1: R=0.2  idx 2: R=0.3  idx 3: R=0.4
+  completions: 6
+  parallelism: 6
+  # idx 0-3: k=8,16,24,32 (relative, beta=True)
+  # idx 4: k=16 relative beta=False ablation
+  # idx 5: k=16 raw beta=True ablation
   completionMode: Indexed
   backoffLimit: 2
   ttlSecondsAfterFinished: 604800
@@ -42,32 +44,41 @@ spec:
             - |
               set -eux
 
-              pip install pyjet -q
+              pip install hdbscan -q
 
               export DATADIR_JetClass=/ParTGMP/JetClass
               export DDP_NGPUS=1
 
               IDX=${JOB_COMPLETION_INDEX}
 
-              # Stage 1: sweep antikt_R with fixed gmp_k=16
-              # 0: R=0.1   1: R=0.2   2: R=0.3   3: R=0.4
+              # 0-3: k=8,16,24,32 relative beta=True
+              # 4: k=16 relative beta=False ablation
+              # 5: k=16 raw beta=True ablation
               if [ "$IDX" -eq 0 ]; then
-                ANTIKT_R=0.1; GMP_K=16; SUFFIX="antikt_R0p1_k16"
+                GMP_K=8;  BETA=True;  GMP_COORDS='"relative"'; SUFFIX="kmeans_k8_rel_paper2m"
               elif [ "$IDX" -eq 1 ]; then
-                ANTIKT_R=0.2; GMP_K=16; SUFFIX="antikt_R0p2_k16"
+                GMP_K=16; BETA=True;  GMP_COORDS='"relative"'; SUFFIX="kmeans_k16_rel_paper2m"
               elif [ "$IDX" -eq 2 ]; then
-                ANTIKT_R=0.3; GMP_K=16; SUFFIX="antikt_R0p3_k16"
+                GMP_K=24; BETA=True;  GMP_COORDS='"relative"'; SUFFIX="kmeans_k24_rel_paper2m"
+              elif [ "$IDX" -eq 3 ]; then
+                GMP_K=32; BETA=True;  GMP_COORDS='"relative"'; SUFFIX="kmeans_k32_rel_paper2m"
+              elif [ "$IDX" -eq 4 ]; then
+                GMP_K=16; BETA=False; GMP_COORDS='"relative"'; SUFFIX="kmeans_k16_rel_fixedbeta_paper2m"
               else
-                ANTIKT_R=0.4; GMP_K=16; SUFFIX="antikt_R0p4_k16"
+                GMP_K=16; BETA=True;  GMP_COORDS='"raw"';      SUFFIX="kmeans_k16_raw_paper2m"
               fi
 
               GMP_REDUCE='"sum"'
-              GMP_COORDS='"raw"'
-              GMP_CLUSTER='"antikt"'
+              GMP_CLUSTER='"kmeans"'
 
-              SAMPLES_PER_EPOCH=2000000
+              # Paper-like 2M schedule:
+              # - same 2-file-per-class subset definition
+              # - 100k total optimizer steps
+              # - validate/checkpoint every 20k steps by making each epoch 20k steps
               N_FILES=2
               NUM_WORKERS=2
+              NUM_EPOCHS=5
+              STEPS_PER_EPOCH=20000
 
               REPO_DIR="/ParTGMP/repos/${SUFFIX}"
               LOG_DIR="/ParTGMP/logs/${SUFFIX}"
@@ -129,17 +140,17 @@ spec:
                 --network-option gmp_reduce $GMP_REDUCE \
                 --network-option gmp_cluster $GMP_CLUSTER \
                 --network-option gmp_k ${GMP_K} \
-                --network-option antikt_R ${ANTIKT_R} \
+                --network-option gmp_cluster_beta ${BETA} \
                 --network-option gmp_cluster_combine_mlp True \
                 --use-amp \
                 --model-prefix "${RUN_DIR}/net" \
-                --num-epochs 50 \
+                --num-epochs ${NUM_EPOCHS} \
                 --batch-size 512 \
                 --start-lr 1e-3 \
                 --optimizer ranger \
                 --fetch-step 0.01 \
                 --num-workers ${NUM_WORKERS} \
-                --samples-per-epoch ${SAMPLES_PER_EPOCH} \
+                --steps-per-epoch ${STEPS_PER_EPOCH} \
                 --samples-per-epoch-val 5000000 \
                 --gpus 0 \
                 --log "${LOG_DIR}/train.log" \
